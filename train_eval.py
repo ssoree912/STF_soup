@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import random
 import numpy as np
@@ -28,13 +29,63 @@ def _configure_seed(args):
         np.random.seed(0)
 
 
+def _ratio_tag(prefix, value):
+    formatted = f"{value:.4f}".rstrip('0').rstrip('.')
+    formatted = formatted if formatted else "0"
+    formatted = formatted.replace('.', 'p')
+    return f"{prefix}{formatted}"
+
+
+def _get_method_dir(args):
+    mag_ratio = float(getattr(args, 'prune_ratio_magnitude', 0.0) or 0.0)
+    rand_ratio = float(getattr(args, 'prune_ratio_random', 0.0) or 0.0)
+    tags = []
+    if mag_ratio > 0:
+        tags.append(_ratio_tag("mag", mag_ratio))
+    if rand_ratio > 0:
+        tags.append(_ratio_tag("rnd", rand_ratio))
+    prune_epoch = getattr(args, 'prune_epoch', None)
+    if prune_epoch:
+        tags.append(f"ep{prune_epoch}")
+    unprune_epoch = getattr(args, 'unprune_epoch', None)
+    if unprune_epoch:
+        tags.append(f"un{unprune_epoch}")
+    if not tags:
+        return "baseline"
+    return "prune_" + "_".join(tags)
+
+
+def _persist_evaluation(ckpt_dir, auc, scores, labels, roc_parts):
+    scores = np.asarray(scores)
+    labels = np.asarray(labels)
+    fpr, tpr, thresholds = [np.asarray(arr) for arr in roc_parts]
+    metrics_path = os.path.join(ckpt_dir, "metrics.json")
+    metrics_payload = {
+        "auc": float(auc),
+        "num_samples": int(scores.shape[0]),
+        "scores_file": "scores_labels.npz",
+        "roc_files": {
+            "csv": "roc_curve.csv",
+            "npz": "roc_curve.npz"
+        }
+    }
+    with open(metrics_path, 'w') as fp:
+        json.dump(metrics_payload, fp, indent=2, sort_keys=True)
+
+    np.savez(os.path.join(ckpt_dir, "scores_labels.npz"), scores=scores, labels=labels)
+    roc_matrix = np.stack([fpr, tpr, thresholds], axis=1)
+    np.savetxt(os.path.join(ckpt_dir, "roc_curve.csv"), roc_matrix, delimiter=',', header='fpr,tpr,threshold', comments='')
+    np.savez(os.path.join(ckpt_dir, "roc_curve.npz"), fpr=fpr, tpr=tpr, thresholds=thresholds)
+
+
 def _run_single_experiment(base_args):
     args = copy.deepcopy(base_args)
     _configure_seed(args)
     args, model_args = init_sub_args(args)
     random_seed = getattr(args, 'prune_random_seed', None)
     rand_dir = f"rand_{random_seed}" if random_seed is not None else "rand_auto"
-    seed_dir = os.path.join(args.dataset, f"seed_{args.seed}", rand_dir)
+    method_dir = _get_method_dir(args)
+    seed_dir = os.path.join(args.dataset, method_dir, f"seed_{args.seed}", rand_dir)
     args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=seed_dir)
 
     pretrained = vars(args).get('checkpoint', None)
@@ -56,14 +107,15 @@ def _run_single_experiment(base_args):
         dump_args(args, args.ckpt_dir)
 
     normality_scores = trainer.test()
-    auc, scores = score_dataset(normality_scores, dataset["test"].metadata, args=args)
+    auc, scores, labels, roc_parts = score_dataset(normality_scores, dataset["test"].metadata, args=args)
+    _persist_evaluation(args.ckpt_dir, auc, scores, labels, roc_parts)
 
     # Logging and recording results
     print("\n-------------------------------------------------------")
     print("\033[92m Done with {}% AuC for {} samples | Params: {}\033[0m".format(auc * 100, scores.shape[0], num_of_params))
     print("Checkpoint directory:", args.ckpt_dir)
     print("-------------------------------------------------------\n\n")
-    return auc, args.ckpt_dir
+    return auc, args.ckpt_dir, random_seed
 
 
 def main():
@@ -109,8 +161,8 @@ def main():
         run_args.prune_random_seed_list = None
         label_random = random_seed if random_seed is not None else 'auto'
         print(f"\n=== Run {run_idx + 1}/{num_runs} | Train seed {seed} | Random prune seed {label_random} ===")
-        auc, ckpt_dir = _run_single_experiment(run_args)
-        results.append((seed, random_seed, auc, ckpt_dir))
+        auc, ckpt_dir, applied_random_seed = _run_single_experiment(run_args)
+        results.append((seed, applied_random_seed, auc, ckpt_dir))
     if len(results) > 1:
         print("\nMulti-run summary (AUC %):")
         for seed, random_seed, auc, ckpt_dir in results:

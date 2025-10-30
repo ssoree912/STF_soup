@@ -2,7 +2,7 @@ import os
 import re
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve
 from tqdm import tqdm
 from dataset import shanghaitech_hr_skip
 
@@ -25,7 +25,8 @@ def score_dataset(score, metadata, args=None):
     gt_np = np.concatenate(gt_arr)
     scores_np = np.concatenate(scores_arr)
     auc = score_auc(scores_np, gt_np)
-    return auc, scores_np
+    fpr, tpr, thresholds = roc_curve(gt_np, scores_np, drop_intermediate=False)
+    return auc, scores_np, gt_np, (fpr, tpr, thresholds)
 
 
 def get_dataset_scores(scores, metadata, args=None):

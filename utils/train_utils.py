@@ -27,7 +27,16 @@ def dump_args(args, ckpt_dir):
     path = os.path.join(ckpt_dir, "args.json")
     data = vars(args)
     with open(path, 'w') as fp:
-        json.dump(data, fp)
+        json.dump(data, fp, indent=2, sort_keys=True)
+    config_path = os.path.join(ckpt_dir, "config.yaml")
+    with open(config_path, 'w') as cfg:
+        for key in sorted(data.keys()):
+            value = data[key]
+            if isinstance(value, (list, tuple)):
+                value_str = '[' + ', '.join(str(v) for v in value) + ']'
+            else:
+                value_str = str(value)
+            cfg.write(f"{key}: {value_str}\n")
 
 
 def calc_reg_loss(model, reg_type='l2', avg=True):
