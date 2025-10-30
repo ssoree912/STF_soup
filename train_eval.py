@@ -84,7 +84,7 @@ def _run_single_experiment(base_args, run_label=None):
     _configure_seed(args)
     args, model_args = init_sub_args(args)
     random_seed = getattr(args, 'prune_random_seed', None)
-    rand_dir = f"rand_{random_seed}" if random_seed is not None else "rand_auto"
+    rand_dir = f"rand_{random_seed}" if random_seed is not None else "rand_none"
     method_dir = _get_method_dir(args)
     seed_dir = os.path.join(args.dataset, method_dir, f"seed_{args.seed}", rand_dir)
     args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=seed_dir, run_name=run_label)
@@ -148,6 +148,7 @@ def main():
         parser.error("--prune_epoch must be >= 1 when pruning is enabled.")
     if total_ratio == 0:
         args.unprune_epoch = None
+        args.prune_epoch = None
     elif args.unprune_epoch is not None and args.unprune_epoch <= args.prune_epoch:
         parser.error("--unprune_epoch must be greater than --prune_epoch.")
 
@@ -167,7 +168,7 @@ def main():
         run_args.seed_list = None
         run_args.prune_random_seed = random_seed
         run_args.prune_random_seed_list = None
-        label_random = random_seed if random_seed is not None else 'auto'
+        label_random = random_seed if random_seed is not None else 'none'
         if args.run_name:
             run_label = args.run_name if num_runs == 1 else f"{args.run_name}_run{run_idx + 1}"
         else:
@@ -178,7 +179,7 @@ def main():
     if len(results) > 1:
         print("\nMulti-run summary (AUC %):")
         for seed, random_seed, auc, ckpt_dir in results:
-            label_random = random_seed if random_seed is not None else 'auto'
+            label_random = random_seed if random_seed is not None else 'none'
             print(f"  Train seed {seed} | Random seed {label_random}: {auc * 100:.2f}%  -> {ckpt_dir}")
 
 
