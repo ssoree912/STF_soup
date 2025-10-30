@@ -15,6 +15,7 @@ from dataset import get_dataset_and_loader
 from utils.train_utils import dump_args, init_model_params
 from utils.scoring_utils import score_dataset
 from utils.train_utils import calc_num_of_params
+from utils.fisher_utils import compute_occ_fisher
 
 
 def _configure_seed(args):
@@ -78,7 +79,7 @@ def _persist_evaluation(ckpt_dir, auc, scores, labels, roc_parts):
     np.savez(os.path.join(ckpt_dir, "roc_curve.npz"), fpr=fpr, tpr=tpr, thresholds=thresholds)
 
 
-def _run_single_experiment(base_args):
+def _run_single_experiment(base_args, run_label=None):
     args = copy.deepcopy(base_args)
     _configure_seed(args)
     args, model_args = init_sub_args(args)
@@ -86,7 +87,7 @@ def _run_single_experiment(base_args):
     rand_dir = f"rand_{random_seed}" if random_seed is not None else "rand_auto"
     method_dir = _get_method_dir(args)
     seed_dir = os.path.join(args.dataset, method_dir, f"seed_{args.seed}", rand_dir)
-    args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=seed_dir)
+    args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=seed_dir, run_name=run_label)
 
     pretrained = vars(args).get('checkpoint', None)
     dataset, loader = get_dataset_and_loader(args, trans_list=trans_list, only_test=(pretrained is not None))
@@ -109,6 +110,13 @@ def _run_single_experiment(base_args):
     normality_scores = trainer.test()
     auc, scores, labels, roc_parts = score_dataset(normality_scores, dataset["test"].metadata, args=args)
     _persist_evaluation(args.ckpt_dir, auc, scores, labels, roc_parts)
+    if getattr(args, 'compute_fisher', False):
+        fisher = compute_occ_fisher(model, loader['train'], torch.device(args.device),
+                                    max_batches=getattr(args, 'fisher_max_batches', 50),
+                                    fisher_floor=getattr(args, 'fisher_floor', 1e-8),
+                                    normalize=getattr(args, 'fisher_normalize', False))
+        fisher_path = os.path.join(args.ckpt_dir, "fisher_diag.pt")
+        torch.save(fisher, fisher_path)
 
     # Logging and recording results
     print("\n-------------------------------------------------------")
@@ -160,8 +168,12 @@ def main():
         run_args.prune_random_seed = random_seed
         run_args.prune_random_seed_list = None
         label_random = random_seed if random_seed is not None else 'auto'
+        if args.run_name:
+            run_label = args.run_name if num_runs == 1 else f"{args.run_name}_run{run_idx + 1}"
+        else:
+            run_label = None
         print(f"\n=== Run {run_idx + 1}/{num_runs} | Train seed {seed} | Random prune seed {label_random} ===")
-        auc, ckpt_dir, applied_random_seed = _run_single_experiment(run_args)
+        auc, ckpt_dir, applied_random_seed = _run_single_experiment(run_args, run_label=run_label)
         results.append((seed, applied_random_seed, auc, ckpt_dir))
     if len(results) > 1:
         print("\nMulti-run summary (AUC %):")

@@ -44,6 +44,7 @@ def init_parser(default_data_dir='data/', default_exp_dir='data/exp_dir'):
     parser.add_argument('--device', type=str, default='cuda:0', metavar='DEV', help='Device for feature calculation (default: \'cuda:0\')')
     parser.add_argument('--seed', type=int, metavar='S', default=999, help='Random seed, use 999 for random (default: 999)')
     parser.add_argument('--seed_list', type=int, nargs='+', default=None, help='Optional list of seeds for sequential runs; overrides --seed when provided')
+    parser.add_argument('--run_name', type=str, default=None, help='Optional custom run folder name (timestamp used when omitted)')
     parser.add_argument('--verbose', type=int, default=1, metavar='V', choices=[0, 1], help='Verbosity [1/0] (default: 1)')
     parser.add_argument('--data_dir', type=str, default=default_data_dir, metavar='DATA_DIR', help="Path to directory holding .npy and .pkl files (default: {})".format(default_data_dir))
     parser.add_argument('--exp_dir', type=str, default=default_exp_dir, metavar='EXP_DIR', help="Path to the directory where models will be saved (default: {})".format(default_exp_dir))
@@ -91,6 +92,10 @@ def init_parser(default_data_dir='data/', default_exp_dir='data/exp_dir'):
     parser.add_argument('--prune_ratio_random', type=float, default=0.0, help='Random pruning ratio applied at prune_epoch')
     parser.add_argument('--prune_random_seed', type=int, default=None, help='Seed for random pruning mask (single run)')
     parser.add_argument('--prune_random_seed_list', type=int, nargs='+', default=None, help='Optional list of seeds for random pruning masks across runs')
+    parser.add_argument('--compute_fisher', action='store_true', help='Compute Fisher information for trained model')
+    parser.add_argument('--fisher_max_batches', type=int, default=50, help='Max batches to use when estimating Fisher information')
+    parser.add_argument('--fisher_floor', type=float, default=1e-8, help='Minimum value to clamp Fisher entries')
+    parser.add_argument('--fisher_normalize', action='store_true', help='Normalize Fisher tensors by their norm')
 
     return parser
 
@@ -107,8 +112,16 @@ def args_rm_prefix(args, prefix):
     return wp_args
 
 
-def create_exp_dirs(experiment_dir, dirmap=''):
-    time_str = time.strftime("%b%d_%H%M")
+def _sanitize_run_name(name):
+    if name is None:
+        return None
+    safe = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in name)
+    return safe.strip('_') or None
+
+
+def create_exp_dirs(experiment_dir, dirmap='', run_name=None):
+    run_name = _sanitize_run_name(run_name)
+    time_str = run_name if run_name else time.strftime("%b%d_%H%M")
 
     experiment_dir = os.path.join(experiment_dir, dirmap, time_str)
     dirs = [experiment_dir]
