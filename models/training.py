@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 from torch.nn.utils import prune
+from utils.scoring_utils import score_dataset
 
 
 def adjust_lr(optimizer, epoch, lr=None, lr_decay=None, scheduler=None):
@@ -42,11 +43,12 @@ def compute_loss(nll, reduction="mean", mean=0):
 
 class Trainer:
     def __init__(self, args, model, train_loader, test_loader,
-                 optimizer_f=None, scheduler_f=None):
+                 optimizer_f=None, scheduler_f=None, test_metadata=None):
         self.model = model
         self.args = args
         self.train_loader = train_loader
         self.test_loader = test_loader
+        self.test_metadata = test_metadata
         # Loss, Optimizer and Scheduler
         if optimizer_f is None:
             self.optimizer = self.get_optimizer()
@@ -74,6 +76,7 @@ class Trainer:
             self.unprune_epoch = None
         self._pruned_params = []
         self.pruning_applied = False
+        self.best_auc = None
 
     def get_optimizer(self):
         if self.args.optimizer == 'adam':
@@ -155,7 +158,8 @@ class Trainer:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                     pbar.set_description("Loss: {}".format(losses.item()))
-                    log_writer.add_scalar('NLL Loss', losses.item(), epoch * len(self.train_loader) + itern)
+                    if log_writer is not None:
+                        log_writer.add_scalar('NLL Loss', losses.item(), epoch * len(self.train_loader) + itern)
 
                 except KeyboardInterrupt:
                     print('Keyboard Interrupted. Save results? [yes/no]')
@@ -169,6 +173,13 @@ class Trainer:
             self.save_checkpoint(epoch, filename=checkpoint_filename)
             new_lr = self.adjust_lr(epoch)
             print('Checkpoint Saved. New LR: {0:.3e}'.format(new_lr))
+            if self.test_metadata is not None:
+                auc = self._evaluate_auc()
+                if (self.best_auc is None) or (auc > self.best_auc):
+                    self.best_auc = auc
+                    best_path = os.path.join(self.args.ckpt_dir, 'checkpoint_best.pth.tar')
+                    shutil.copy(os.path.join(self.args.ckpt_dir, checkpoint_filename), best_path)
+                    print(f'New best checkpoint saved with AUC {auc * 100:.2f}%')
 
     def test(self):
         self.model.eval()
@@ -252,3 +263,9 @@ class Trainer:
         self.pruning_applied = False
         self._pruned_params = []
         print(f"Pruning mask removed at epoch {epoch + 1}")
+
+    def _evaluate_auc(self):
+        normality_scores = self.test()
+        auc, _, _, _ = score_dataset(normality_scores, self.test_metadata, args=self.args)
+        self.model.train()
+        return auc

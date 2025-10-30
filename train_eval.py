@@ -97,7 +97,8 @@ def _run_single_experiment(base_args, run_label=None):
     num_of_params = calc_num_of_params(model)
     trainer = Trainer(args, model, loader['train'], loader['test'],
                       optimizer_f=init_optimizer(args.model_optimizer, lr=args.model_lr),
-                      scheduler_f=init_scheduler(args.model_sched, lr=args.model_lr, epochs=args.epochs))
+                      scheduler_f=init_scheduler(args.model_sched, lr=args.model_lr, epochs=args.epochs),
+                      test_metadata=dataset["test"].metadata)
     if pretrained:
         trainer.load_checkpoint(pretrained)
     else:
@@ -106,6 +107,9 @@ def _run_single_experiment(base_args, run_label=None):
         writer.flush()
         writer.close()
         dump_args(args, args.ckpt_dir)
+        best_ckpt = os.path.join(args.ckpt_dir, 'checkpoint_best.pth.tar')
+        if os.path.exists(best_ckpt):
+            trainer.load_checkpoint(best_ckpt)
 
     normality_scores = trainer.test()
     auc, scores, labels, roc_parts = score_dataset(normality_scores, dataset["test"].metadata, args=args)

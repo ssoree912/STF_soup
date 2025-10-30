@@ -2,7 +2,7 @@ import argparse
 import json
 from argparse import Namespace
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,14 +15,39 @@ from utils.data_utils import trans_list
 from utils.scoring_utils import score_dataset
 from utils.train_utils import init_model_params
 
+SKIP_SOUP_SUBSTRINGS = (
+    ".actnorm.",
+    "running_mean",
+    "running_var",
+    "num_batches_tracked",
+    "prior_h",
+)
+
+
+def _should_skip_parameter(name: str, tensor: torch.Tensor) -> bool:
+    if name.endswith("actnorm.inited"):
+        return True
+    if tensor.ndim <= 1:
+        return True
+    return any(token in name for token in SKIP_SOUP_SUBSTRINGS)
+
 
 def _load_checkpoint(checkpoint_path: Path) -> Dict[str, torch.Tensor]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     if "state_dict" in checkpoint:
-        return checkpoint["state_dict"]
-    if isinstance(checkpoint, dict):
-        return checkpoint
-    raise ValueError(f"Unsupported checkpoint format at {checkpoint_path}")
+        state = checkpoint["state_dict"]
+    elif isinstance(checkpoint, dict):
+        state = checkpoint
+    else:
+        raise ValueError(f"Unsupported checkpoint format at {checkpoint_path}")
+    for key in list(state.keys()):
+        if key.endswith("actnorm.inited"):
+            tensor = state[key]
+            if torch.is_tensor(tensor):
+                state[key] = torch.ones_like(tensor)
+            else:
+                state[key] = 1
+    return state
 
 
 def _load_fisher(fisher_path: Path) -> Dict[str, torch.Tensor]:
@@ -34,7 +59,7 @@ def _load_fisher(fisher_path: Path) -> Dict[str, torch.Tensor]:
     raise ValueError(f"Unsupported fisher format at {fisher_path}")
 
 
-def _find_file(run_dir: Path, explicit_name: str | None, pattern: str) -> Path:
+def _find_file(run_dir: Path, explicit_name: Optional[str], pattern: str) -> Path:
     if explicit_name:
         candidate = run_dir / explicit_name
         if candidate.exists():
@@ -78,7 +103,7 @@ def _load_reference_args(args_path: Path) -> Namespace:
 
 def _evaluate_soup_model(state_dict: Dict[str, torch.Tensor],
                          reference_args_path: Path,
-                         device_override: str | None = None):
+                         device_override: Optional[str] = None):
     if not reference_args_path.exists():
         raise FileNotFoundError(f"No args.json found at {reference_args_path}")
     ref_args = _load_reference_args(reference_args_path)
@@ -95,6 +120,8 @@ def _evaluate_soup_model(state_dict: Dict[str, torch.Tensor],
         print(f"Warning: missing keys when loading soup state dict: {missing_keys}")
     if unexpected_keys:
         print(f"Warning: unexpected keys when loading soup state dict: {unexpected_keys}")
+    if hasattr(model, "set_actnorm_init"):
+        model.set_actnorm_init()
     device = torch.device(ref_args.device)
     model.to(device)
     model.eval()
@@ -120,39 +147,64 @@ def _evaluate_soup_model(state_dict: Dict[str, torch.Tensor],
 
 
 def _combine_uniform(states: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    num_models = len(states)
-    combined: Dict[str, torch.Tensor] = {}
+    reference = states[0]
+    average_names = [name for name, tensor in reference.items() if not _should_skip_parameter(name, tensor)]
+    combined: Dict[str, torch.Tensor] = {name: torch.zeros_like(reference[name]) for name in average_names}
+
     for state in states:
-        for name, tensor in state.items():
-            if name not in combined:
-                combined[name] = tensor.clone()
-            else:
-                combined[name] += tensor
+        for name in average_names:
+            combined[name] += state[name]
+
+    num_models = len(states)
+    combined = {name: tensor / num_models for name, tensor in combined.items()}
+
+    result = {name: reference[name].clone() for name in reference.keys()}
     for name in combined:
-        combined[name] /= num_models
-    return combined
+        result[name] = combined[name]
+    return result
+
+
+def _flag_actnorm_inited(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    for name in list(state.keys()):
+        if name.endswith("actnorm.inited"):
+            tensor = state[name]
+            if torch.is_tensor(tensor):
+                state[name] = torch.ones_like(tensor)
+            else:
+                state[name] = 1
+        if ".actnorm.bias" in name or ".actnorm.logs" in name:
+            tensor = state[name]
+            if tensor.isnan().any():
+                raise ValueError(f"ActNorm parameter {name} contains NaNs")
+    return state
 
 
 def _combine_fisher(states: List[Dict[str, torch.Tensor]], fisher_list: List[Dict[str, torch.Tensor]],
                     eps: float = 1e-8) -> Dict[str, torch.Tensor]:
-    combined: Dict[str, torch.Tensor] = {}
-    denom: Dict[str, torch.Tensor] = {}
+    reference = states[0]
+    average_names = [name for name, tensor in reference.items() if not _should_skip_parameter(name, tensor)]
+    combined: Dict[str, torch.Tensor] = {name: torch.zeros_like(reference[name]) for name in average_names}
+    denom: Dict[str, torch.Tensor] = {name: torch.zeros_like(reference[name]) for name in average_names}
+    warned_missing = set()
     for state, fisher in zip(states, fisher_list):
-        for name, tensor in state.items():
+        for name in average_names:
+            tensor = state[name]
             fisher_tensor = fisher.get(name)
             if fisher_tensor is None:
-                raise KeyError(f"Missing fisher entry for parameter '{name}'")
-            if name not in combined:
-                combined[name] = tensor.clone() * fisher_tensor
-                denom[name] = fisher_tensor.clone()
-            else:
-                combined[name] += tensor * fisher_tensor
-                denom[name] += fisher_tensor
+                if name not in warned_missing:
+                    print(f"Warning: missing fisher entry for '{name}', falling back to uniform weight")
+                    warned_missing.add(name)
+                fisher_tensor = torch.ones_like(tensor)
+            combined[name] += tensor * fisher_tensor
+            denom[name] += fisher_tensor
 
-    for name in combined:
+    for name in average_names:
         denom_tensor = denom[name].clamp_min(eps)
         combined[name] = combined[name] / denom_tensor
-    return combined
+    result = {name: reference[name].clone() for name in reference.keys()}
+    for name in combined:
+        result[name] = combined[name]
+    return result
 
 
 def _aggregate_fisher(fisher_list: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -167,8 +219,8 @@ def _aggregate_fisher(fisher_list: List[Dict[str, torch.Tensor]]) -> Dict[str, t
 
 
 def fisher_soup(run_dirs: List[Path],
-                checkpoint_name: str | None,
-                fisher_name: str,
+                checkpoint_name: Optional[str],
+                fisher_name: Optional[str],
                 method: str,
                 checkpoint_pattern: str,
                 fisher_pattern: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], List[Dict]]:
@@ -206,6 +258,8 @@ def fisher_soup(run_dirs: List[Path],
         combined_state = _combine_fisher(states, fishers)
         combined_fisher = _aggregate_fisher(fishers)
 
+    combined_state = _flag_actnorm_inited(combined_state)
+
     return combined_state, combined_fisher, meta
 
 
@@ -232,7 +286,7 @@ def parse_args():
     parser.add_argument("--method", choices=["fisher", "uniform"], default="fisher", help="Combination strategy")
     parser.add_argument("--checkpoint_name", default=None, help="Specific checkpoint file name inside each run dir")
     parser.add_argument("--fisher_name", default=None, help="Specific fisher file name inside each run dir (default: fisher_diag.pt)")
-    parser.add_argument("--checkpoint_pattern", default="*_checkpoint.pth.tar", help="Glob pattern to locate checkpoint if name not provided")
+    parser.add_argument("--checkpoint_pattern", default="checkpoint_best.pth.tar", help="Glob pattern to locate checkpoint if name not provided")
     parser.add_argument("--fisher_pattern", default="fisher_diag.pt", help="Glob pattern to locate fisher file if name not provided")
     parser.add_argument("--save_fisher", action="store_true", help="Save aggregated fisher tensor alongside soup checkpoint")
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation on the combined soup and save ROC metrics")
