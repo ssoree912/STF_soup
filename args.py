@@ -43,6 +43,7 @@ def init_parser(default_data_dir='data/', default_exp_dir='data/exp_dir'):
     parser.add_argument('--vid_res', type=str, default=None, help='Video Res')
     parser.add_argument('--device', type=str, default='cuda:0', metavar='DEV', help='Device for feature calculation (default: \'cuda:0\')')
     parser.add_argument('--seed', type=int, metavar='S', default=999, help='Random seed, use 999 for random (default: 999)')
+    parser.add_argument('--seed_list', type=int, nargs='+', default=None, help='Optional list of seeds for sequential runs; overrides --seed when provided')
     parser.add_argument('--verbose', type=int, default=1, metavar='V', choices=[0, 1], help='Verbosity [1/0] (default: 1)')
     parser.add_argument('--data_dir', type=str, default=default_data_dir, metavar='DATA_DIR', help="Path to directory holding .npy and .pkl files (default: {})".format(default_data_dir))
     parser.add_argument('--exp_dir', type=str, default=default_exp_dir, metavar='EXP_DIR', help="Path to the directory where models will be saved (default: {})".format(default_exp_dir))
@@ -80,6 +81,16 @@ def init_parser(default_data_dir='data/', default_exp_dir='data/exp_dir'):
     parser.add_argument('--flow_permutation', type=str, default='permute', help='Permutation layer type')
     parser.add_argument('--adj_strategy', type=str, default='uniform', help='Adjacency matrix strategy')
     parser.add_argument('--max_hops', type=int, default=8, help='Adjacency matrix neighbours')
+
+    # Pruning Args
+    parser.add_argument('--prune_ratio', type=float, default=0.0, help='(Deprecated) single pruning ratio; use --prune_ratio_magnitude or --prune_ratio_random')
+    parser.add_argument('--prune_epoch', type=int, default=1, help='Epoch (1-based) to apply magnitude pruning when enabled')
+    parser.add_argument('--unprune_epoch', type=int, default=None, help='Epoch (1-based) to remove pruning mask; ignored if pruning disabled')
+    parser.add_argument('--prune_method', type=str, default='magnitude', choices=['magnitude', 'random'], help='Pruning strategy to use when pruning is enabled')
+    parser.add_argument('--prune_ratio_magnitude', type=float, default=0.0, help='Magnitude(L1) pruning ratio applied at prune_epoch')
+    parser.add_argument('--prune_ratio_random', type=float, default=0.0, help='Random pruning ratio applied at prune_epoch')
+    parser.add_argument('--prune_random_seed', type=int, default=None, help='Seed for random pruning mask (single run)')
+    parser.add_argument('--prune_random_seed_list', type=int, nargs='+', default=None, help='Optional list of seeds for random pruning masks across runs')
 
     return parser
 
@@ -120,4 +131,3 @@ def save_dataset(dataset, fname):
 def load_dataset(fname):
     with open(fname, 'rb') as file:
         return pickle.load(file)
-

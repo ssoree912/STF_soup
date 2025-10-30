@@ -1,3 +1,5 @@
+import copy
+import os
 import random
 import numpy as np
 import torch
@@ -14,10 +16,7 @@ from utils.scoring_utils import score_dataset
 from utils.train_utils import calc_num_of_params
 
 
-def main():
-    parser = init_parser()
-    args = parser.parse_args()
-
+def _configure_seed(args):
     if args.seed == 999:  # Record and init seed
         args.seed = torch.initial_seed()
         np.random.seed(0)
@@ -28,8 +27,15 @@ def main():
         torch.manual_seed(args.seed)
         np.random.seed(0)
 
+
+def _run_single_experiment(base_args):
+    args = copy.deepcopy(base_args)
+    _configure_seed(args)
     args, model_args = init_sub_args(args)
-    args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=args.dataset)
+    random_seed = getattr(args, 'prune_random_seed', None)
+    rand_dir = f"rand_{random_seed}" if random_seed is not None else "rand_auto"
+    seed_dir = os.path.join(args.dataset, f"seed_{args.seed}", rand_dir)
+    args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=seed_dir)
 
     pretrained = vars(args).get('checkpoint', None)
     dataset, loader = get_dataset_and_loader(args, trans_list=trans_list, only_test=(pretrained is not None))
@@ -43,8 +49,10 @@ def main():
     if pretrained:
         trainer.load_checkpoint(pretrained)
     else:
-        writer = SummaryWriter()
+        writer = SummaryWriter(log_dir=os.path.join(args.ckpt_dir, 'tensorboard'))
         trainer.train(log_writer=writer)
+        writer.flush()
+        writer.close()
         dump_args(args, args.ckpt_dir)
 
     normality_scores = trainer.test()
@@ -52,8 +60,62 @@ def main():
 
     # Logging and recording results
     print("\n-------------------------------------------------------")
-    print("\033[92m Done with {}% AuC for {} samples\033[0m".format(auc * 100, scores.shape[0]))
+    print("\033[92m Done with {}% AuC for {} samples | Params: {}\033[0m".format(auc * 100, scores.shape[0], num_of_params))
+    print("Checkpoint directory:", args.ckpt_dir)
     print("-------------------------------------------------------\n\n")
+    return auc, args.ckpt_dir
+
+
+def main():
+    parser = init_parser()
+    args = parser.parse_args()
+
+    if args.prune_ratio < 0 or args.prune_ratio >= 1.0:
+        parser.error("--prune_ratio must be in the range [0, 1).")
+    if args.prune_ratio_magnitude < 0 or args.prune_ratio_magnitude >= 1.0:
+        parser.error("--prune_ratio_magnitude must be in the range [0, 1).")
+    if args.prune_ratio_random < 0 or args.prune_ratio_random >= 1.0:
+        parser.error("--prune_ratio_random must be in the range [0, 1).")
+    if args.prune_ratio_magnitude == 0 and args.prune_ratio_random == 0 and args.prune_ratio > 0:
+        if args.prune_method == 'random':
+            args.prune_ratio_random = args.prune_ratio
+        else:
+            args.prune_ratio_magnitude = args.prune_ratio
+    total_ratio = args.prune_ratio_magnitude + args.prune_ratio_random
+    if total_ratio >= 1.0:
+        parser.error("Combined pruning ratios must sum to less than 1.")
+    if total_ratio > 0 and args.prune_epoch < 1:
+        parser.error("--prune_epoch must be >= 1 when pruning is enabled.")
+    if total_ratio == 0:
+        args.unprune_epoch = None
+    elif args.unprune_epoch is not None and args.unprune_epoch <= args.prune_epoch:
+        parser.error("--unprune_epoch must be greater than --prune_epoch.")
+
+    base_seed_list = args.seed_list if args.seed_list else [args.seed]
+    random_seed_list = args.prune_random_seed_list if args.prune_random_seed_list else ([args.prune_random_seed] if args.prune_random_seed is not None else [None])
+    num_runs = max(len(base_seed_list), len(random_seed_list))
+    if len(base_seed_list) not in (1, num_runs):
+        parser.error("Length of --seed_list must match random seed list or be a single value.")
+    if len(random_seed_list) not in (1, num_runs):
+        parser.error("Length of --prune_random_seed_list must match seed list or be a single value.")
+    results = []
+    for run_idx in range(num_runs):
+        seed = base_seed_list[run_idx] if len(base_seed_list) > 1 else base_seed_list[0]
+        random_seed = random_seed_list[run_idx] if len(random_seed_list) > 1 else random_seed_list[0]
+        run_args = copy.deepcopy(args)
+        run_args.seed = seed
+        run_args.seed_list = None
+        run_args.prune_random_seed = random_seed
+        run_args.prune_random_seed_list = None
+        label_random = random_seed if random_seed is not None else 'auto'
+        print(f"\n=== Run {run_idx + 1}/{num_runs} | Train seed {seed} | Random prune seed {label_random} ===")
+        auc, ckpt_dir = _run_single_experiment(run_args)
+        results.append((seed, random_seed, auc, ckpt_dir))
+    if len(results) > 1:
+        print("\nMulti-run summary (AUC %):")
+        for seed, random_seed, auc, ckpt_dir in results:
+            label_random = random_seed if random_seed is not None else 'auto'
+            print(f"  Train seed {seed} | Random seed {label_random}: {auc * 100:.2f}%  -> {ckpt_dir}")
 
 
 if __name__ == '__main__':

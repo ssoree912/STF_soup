@@ -6,8 +6,10 @@ import os
 import time
 import shutil
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+from torch.nn.utils import prune
 
 
 def adjust_lr(optimizer, epoch, lr=None, lr_decay=None, scheduler=None):
@@ -54,6 +56,24 @@ class Trainer:
             self.scheduler = None
         else:
             self.scheduler = scheduler_f(self.optimizer)
+        self.prune_epoch = getattr(self.args, 'prune_epoch', None)
+        self.unprune_epoch = getattr(self.args, 'unprune_epoch', None)
+        self.prune_method = getattr(self.args, 'prune_method', 'magnitude')
+        self.magnitude_ratio = float(getattr(self.args, 'prune_ratio_magnitude', 0.0))
+        self.random_ratio = float(getattr(self.args, 'prune_ratio_random', 0.0))
+        self.prune_ratio = getattr(self.args, 'prune_ratio', 0.0)
+        self.random_seed = getattr(self.args, 'prune_random_seed', None)
+        if self.prune_ratio and not (self.magnitude_ratio or self.random_ratio):
+            if self.prune_method == 'random':
+                self.random_ratio = float(self.prune_ratio)
+            else:
+                self.magnitude_ratio = float(self.prune_ratio)
+        total_ratio = self.magnitude_ratio + self.random_ratio
+        if total_ratio <= 0:
+            self.prune_epoch = None
+            self.unprune_epoch = None
+        self._pruned_params = []
+        self.pruning_applied = False
 
     def get_optimizer(self):
         if self.args.optimizer == 'adam':
@@ -109,6 +129,8 @@ class Trainer:
         self.model = self.model.to(self.args.device)
         key_break = False
         for epoch in range(start_epoch, num_epochs):
+            self._maybe_apply_pruning(epoch)
+            self._maybe_remove_pruning(epoch)
             if key_break:
                 break
             print("Starting Epoch {} / {}".format(epoch + 1, num_epochs))
@@ -174,3 +196,59 @@ class Trainer:
                             'state_dict': self.model.state_dict(),
                             'optimizer': self.optimizer.state_dict(), }
         return checkpoint_state
+
+    def _collect_prunable_parameters(self):
+        params = []
+        for module in self.model.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                params.append((module, 'weight'))
+        return params
+
+    def _maybe_apply_pruning(self, epoch):
+        if self.prune_epoch is None:
+            return
+        if self.pruning_applied:
+            return
+        if (epoch + 1) < self.prune_epoch:
+            return
+        params = self._collect_prunable_parameters()
+        if not params:
+            print("Warning: no prunable parameters found; skipping pruning")
+            self.prune_epoch = None
+            return
+        if self.magnitude_ratio > 0:
+            prune.global_unstructured(params, pruning_method=prune.L1Unstructured, amount=self.magnitude_ratio)
+            print(f"Applied global magnitude pruning at epoch {epoch + 1} with ratio {self.magnitude_ratio:.2f}")
+        if self.random_ratio > 0:
+            cpu_state = None
+            cuda_state = None
+            if self.random_seed is not None:
+                cpu_state = torch.random.get_rng_state()
+                if torch.cuda.is_available():
+                    cuda_state = torch.cuda.get_rng_state_all()
+                    torch.cuda.manual_seed_all(self.random_seed)
+                torch.manual_seed(self.random_seed)
+            prune.global_unstructured(params, pruning_method=prune.RandomUnstructured, amount=self.random_ratio)
+            if self.random_seed is not None:
+                torch.random.set_rng_state(cpu_state)
+                if cuda_state is not None:
+                    torch.cuda.set_rng_state_all(cuda_state)
+            print(f"Applied global random pruning at epoch {epoch + 1} with ratio {self.random_ratio:.2f} (seed {self.random_seed})")
+        self._pruned_params = params
+        self.pruning_applied = True
+
+    def _maybe_remove_pruning(self, epoch):
+        if self.unprune_epoch is None:
+            return
+        if not self.pruning_applied:
+            return
+        if (epoch + 1) < self.unprune_epoch:
+            return
+        for module, _ in self._pruned_params:
+            try:
+                prune.remove(module, 'weight')
+            except ValueError:
+                continue
+        self.pruning_applied = False
+        self._pruned_params = []
+        print(f"Pruning mask removed at epoch {epoch + 1}")
