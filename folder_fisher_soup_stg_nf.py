@@ -160,7 +160,26 @@ def compute_fisher_for_checkpoint(checkpoint_path: Path,
     else:
         raise ValueError(f"Unsupported checkpoint format at {checkpoint_path}")
 
-    model.load_state_dict(state_dict)
+    # Handle pruned weights stored as weight_orig/weight_mask
+    merged_state = {}
+    for key, value in list(state_dict.items()):
+        if key.endswith("weight_orig"):
+            base_key = key[:-len("weight_orig")] + "weight"
+            mask_key = key[:-len("weight_orig")] + "weight_mask"
+            mask_tensor = state_dict.get(mask_key)
+            if mask_tensor is None:
+                mask_tensor = torch.ones_like(value)
+            merged_state[base_key] = value * mask_tensor
+        elif key.endswith("weight_mask"):
+            continue
+        elif key.endswith("actnorm.inited"):
+            merged_state[key] = torch.ones_like(value) if torch.is_tensor(value) else 1
+        else:
+            merged_state[key] = value
+
+    model.load_state_dict(merged_state, strict=False)
+    if hasattr(model, "set_actnorm_init"):
+        model.set_actnorm_init()
     model.to(device)
 
     # Initialize Fisher computation

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import os
 from typing import List, Dict, Tuple, Optional, Sequence
 import logging
 from collections import namedtuple
@@ -359,12 +360,14 @@ def load_models_and_fishers(checkpoint_paths: List[str],
         
         # Load mask if exists
         mask_path = ckpt_path + ".mask"
-        if torch.load(mask_path, map_location='cpu') if hasattr(torch, 'load') else None:
+        if os.path.exists(mask_path):
             try:
                 raw_mask_dict = torch.load(mask_path, map_location='cpu')
                 bool_mask = {key: (tensor != 0).to(torch.bool) for key, tensor in raw_mask_dict.items()}
                 masks.append(bool_mask)
-            except:
+                logger.info(f"Loaded pruning mask from {mask_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load mask from {mask_path}: {e}")
                 masks.append(None)
         else:
             masks.append(None)
