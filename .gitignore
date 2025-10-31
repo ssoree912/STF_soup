@@ -203,3 +203,5 @@ data/UBnormal/pose/
 runs/*
 data/exp_dir/*
 experiments/*
+soups/*
+sample/*

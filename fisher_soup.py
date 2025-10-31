@@ -2,7 +2,7 @@ import argparse
 import json
 from argparse import Namespace
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -29,7 +29,9 @@ def _should_skip_parameter(name: str, tensor: torch.Tensor) -> bool:
         return True
     if tensor.ndim <= 1:
         return True
-    return any(token in name for token in SKIP_SOUP_SUBSTRINGS)
+    if any(token in name for token in SKIP_SOUP_SUBSTRINGS):
+        return True
+    return False
 
 
 def _load_checkpoint(checkpoint_path: Path) -> Dict[str, torch.Tensor]:
@@ -50,7 +52,7 @@ def _load_checkpoint(checkpoint_path: Path) -> Dict[str, torch.Tensor]:
     return state
 
 
-def _load_fisher(fisher_path: Path) -> Dict[str, torch.Tensor]:
+def _load_fisher(fisher_path: Path) -> Tuple[Dict[str, torch.Tensor], Dict]:
     fisher_blob = torch.load(fisher_path, map_location="cpu")
     if isinstance(fisher_blob, dict) and "fisher" in fisher_blob:
         return fisher_blob["fisher"], fisher_blob.get("metadata", {})
@@ -179,6 +181,26 @@ def _flag_actnorm_inited(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tens
     return state
 
 
+def _project_invertible(W: torch.Tensor, sigma_min: float = 1e-3) -> torch.Tensor:
+    # Ensure 1x1 invertible conv (or similar square matrices) remain well-conditioned
+    # by clamping minimal singular value.
+    U, S, Vh = torch.linalg.svd(W)
+    S = S.clamp_min(sigma_min)
+    return (U @ torch.diag(S) @ Vh).to(W.dtype)
+
+def _project_invertible_layers(state: Dict[str, torch.Tensor], sigma_min: float = 1e-3) -> Dict[str, torch.Tensor]:
+    for name, tensor in state.items():
+        # Heuristic: square 2D weights that likely belong to invertible 1x1 conv/perm layers
+        if tensor.ndim == 2 and tensor.shape[0] == tensor.shape[1]:
+            lowered = name.lower()
+            if any(tag in lowered for tag in ("invconv", "invertible", "perm", "1x1", "conv1x1")):
+                try:
+                    state[name] = _project_invertible(tensor, sigma_min=sigma_min)
+                except Exception as e:
+                    print(f"Warning: SVD projection failed for {name}: {e}")
+    return state
+
+
 def _combine_fisher(states: List[Dict[str, torch.Tensor]], fisher_list: List[Dict[str, torch.Tensor]],
                     eps: float = 1e-8) -> Dict[str, torch.Tensor]:
     reference = states[0]
@@ -195,8 +217,14 @@ def _combine_fisher(states: List[Dict[str, torch.Tensor]], fisher_list: List[Dic
                     print(f"Warning: missing fisher entry for '{name}', falling back to uniform weight")
                     warned_missing.add(name)
                 fisher_tensor = torch.ones_like(tensor)
-            combined[name] += tensor * fisher_tensor
-            denom[name] += fisher_tensor
+
+            # Per-tensor Fisher normalization (mean-based), with safety clamps
+            f = fisher_tensor.abs()
+            scale = f.mean().clamp_min(eps)
+            f = (f / scale).clamp_min(1e-8)
+
+            combined[name] += tensor * f
+            denom[name]    += f
 
     for name in average_names:
         denom_tensor = denom[name].clamp_min(eps)
@@ -218,12 +246,102 @@ def _aggregate_fisher(fisher_list: List[Dict[str, torch.Tensor]]) -> Dict[str, t
     return total
 
 
-def fisher_soup(run_dirs: List[Path],
-                checkpoint_name: Optional[str],
-                fisher_name: Optional[str],
-                method: str,
-                checkpoint_pattern: str,
-                fisher_pattern: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], List[Dict]]:
+def _compute_fisher_norms(fishers: List[Dict[str, torch.Tensor]]) -> Optional[List[torch.Tensor]]:
+    if not fishers or not fishers[0]:
+        return None
+    norms = []
+    for fisher in fishers:
+        total = torch.tensor(0.0)
+        for tensor in fisher.values():
+            total = total + torch.sum(tensor ** 2)
+        norms.append(torch.sqrt(total).clamp_min(1e-12))
+    return norms
+
+
+def _combine_with_coeffs(states: List[Dict[str, torch.Tensor]],
+                         fishers: List[Dict[str, torch.Tensor]],
+                         coeffs: Sequence[float],
+                         method: str,
+                         fisher_floor: float,
+                         favor_target_model: bool,
+                         normalize_fisher: bool) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    reference = states[0]
+    names_to_mix = [name for name, tensor in reference.items() if not _should_skip_parameter(name, tensor)]
+    coeffs = list(coeffs)
+
+    fisher_norms = _compute_fisher_norms(fishers) if (method == "fisher" and normalize_fisher) else None
+
+    combined = {name: reference[name].clone() for name in reference.keys()}
+    aggregated_fisher = {} if fishers and fishers[0] else {}
+
+    for name in names_to_mix:
+        numerator = None
+        denominator = None
+        fisher_accum = None
+        for idx, (state, coeff) in enumerate(zip(states, coeffs)):
+            tensor = state[name]
+            if method == "uniform" or not fishers or not fishers[idx]:
+                weight = torch.tensor(coeff, dtype=tensor.dtype, device=tensor.device)
+                if tensor.ndim > 0:
+                    weight = weight
+                contrib = tensor * weight
+                denom_contrib = weight
+            else:
+                fisher_tensor = fishers[idx].get(name)
+                if fisher_tensor is None:
+                    fisher_tensor = torch.ones_like(tensor)
+                if fisher_norms is not None:
+                    fisher_tensor = fisher_tensor / fisher_norms[idx]
+                if favor_target_model and idx == 0:
+                    clamped = fisher_tensor
+                else:
+                    clamped = torch.clamp(fisher_tensor, min=fisher_floor)
+                weight_tensor = clamped * coeff
+                contrib = tensor * weight_tensor
+                denom_contrib = weight_tensor
+                if aggregated_fisher is not None:
+                    fisher_accum = fisher_accum + (fisher_tensor * coeff) if fisher_accum is not None else (fisher_tensor * coeff)
+
+            numerator = contrib if numerator is None else numerator + contrib
+            denominator = denom_contrib if denominator is None else denominator + denom_contrib
+
+        combined[name] = numerator / denominator.clamp_min(1e-12)
+        if aggregated_fisher is not None and fisher_accum is not None:
+            aggregated_fisher[name] = fisher_accum
+
+    combined = _flag_actnorm_inited(combined)
+    combined = _project_invertible_layers(combined, sigma_min=1e-3)
+
+    return combined, aggregated_fisher
+
+
+def _generate_coefficients(n_models: int, strategy: str, n_combinations: int, seed: int) -> List[List[float]]:
+    if strategy == "uniform" or n_models == 1:
+        return [[1.0 / n_models] * n_models]
+
+    rng = np.random.default_rng(seed)
+    if strategy == "grid" and n_models == 2:
+        points = max(2, n_combinations)
+        weights = []
+        for i in range(points + 1):
+            w0 = i / points
+            w1 = 1.0 - w0
+            weights.append([w0, w1])
+        return weights
+
+    # Random Dirichlet sampling
+    coeffs = []
+    alpha = np.ones(n_models)
+    for _ in range(n_combinations):
+        coeffs.append(rng.dirichlet(alpha).tolist())
+    return coeffs
+
+
+def load_states_and_fishers(run_dirs: List[Path],
+                            checkpoint_name: Optional[str],
+                            fisher_name: Optional[str],
+                            checkpoint_pattern: str,
+                            fisher_pattern: str) -> Tuple[List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]], List[Dict]]:
     states: List[Dict[str, torch.Tensor]] = []
     fishers: List[Dict[str, torch.Tensor]] = []
     meta: List[Dict] = []
@@ -249,18 +367,7 @@ def fisher_soup(run_dirs: List[Path],
             "fisher_meta": fisher_meta,
         })
 
-    if method == "uniform":
-        combined_state = _combine_uniform(states)
-        combined_fisher = _aggregate_fisher(fishers) if fishers and fishers[0] else {}
-    else:
-        if any(not f for f in fishers):
-            raise ValueError("Fisher-weighted combination requested but some runs are missing fisher data")
-        combined_state = _combine_fisher(states, fishers)
-        combined_fisher = _aggregate_fisher(fishers)
-
-    combined_state = _flag_actnorm_inited(combined_state)
-
-    return combined_state, combined_fisher, meta
+    return states, fishers, meta
 
 
 def save_soup(output_path: Path,
@@ -291,6 +398,13 @@ def parse_args():
     parser.add_argument("--save_fisher", action="store_true", help="Save aggregated fisher tensor alongside soup checkpoint")
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation on the combined soup and save ROC metrics")
     parser.add_argument("--eval_device", default=None, help="Device override for soup evaluation (e.g., cpu or cuda:0)")
+    parser.add_argument("--strategy", choices=["uniform", "grid", "random"], default="uniform",
+                        help="Coefficient generation strategy for soup (ignored when method=uniform and strategy=uniform")
+    parser.add_argument("--n_combinations", type=int, default=10, help="Number of coefficient combinations to evaluate")
+    parser.add_argument("--random_seed", type=int, default=42, help="Random seed for coefficient sampling")
+    parser.add_argument("--fisher_floor", type=float, default=1e-8, help="Minimum fisher value applied during merging")
+    parser.add_argument("--no_favor_target", action="store_true", help="Do not treat the first model specially when applying fisher floor")
+    parser.add_argument("--no_normalize_fisher", action="store_true", help="Disable fisher L2 normalization")
     return parser.parse_args()
 
 
@@ -301,14 +415,67 @@ def main():
         if not run_dir.exists():
             raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
-    combined_state, combined_fisher, member_meta = fisher_soup(
+    states, fishers, member_meta = load_states_and_fishers(
         run_dirs=run_dirs,
         checkpoint_name=args.checkpoint_name,
         fisher_name=args.fisher_name,
-        method=args.method,
         checkpoint_pattern=args.checkpoint_pattern,
         fisher_pattern=args.fisher_pattern,
     )
+
+    n_models = len(states)
+    if n_models == 0:
+        raise ValueError("No checkpoints found to combine")
+
+    if args.method == "uniform":
+        coefficient_sets = [[1.0 / n_models] * n_models]
+    else:
+        strategy = args.strategy if args.strategy != "uniform" else ("grid" if n_models == 2 else "random")
+        coefficient_sets = _generate_coefficients(n_models, strategy, args.n_combinations, args.random_seed)
+
+    favor_target = not args.no_favor_target
+    normalize_fisher = not args.no_normalize_fisher
+
+    best_state = None
+    best_fisher = {}
+    best_coeffs = None
+    best_auc = float("-inf")
+    best_eval_payload = None
+    search_results = []
+    reference_args_path = run_dirs[0] / "args.json"
+
+    for coeffs in coefficient_sets:
+        combined_state, aggregated_fisher = _combine_with_coeffs(
+            states=states,
+            fishers=fishers,
+            coeffs=coeffs,
+            method=args.method,
+            fisher_floor=args.fisher_floor,
+            favor_target_model=favor_target,
+            normalize_fisher=normalize_fisher,
+        )
+
+        if args.evaluate:
+            auc, scores_np, labels_np, roc_parts, ref_args = _evaluate_soup_model(
+                combined_state,
+                reference_args_path=reference_args_path,
+                device_override=args.eval_device,
+            )
+            search_results.append({"coefficients": coeffs, "auc": float(auc)})
+            if auc > best_auc:
+                best_auc = auc
+                best_state = combined_state
+                best_fisher = aggregated_fisher
+                best_coeffs = coeffs
+                best_eval_payload = (scores_np, labels_np, roc_parts, ref_args)
+        else:
+            if best_state is None:
+                best_state = combined_state
+                best_fisher = aggregated_fisher
+                best_coeffs = coeffs
+
+    if best_state is None:
+        raise RuntimeError("Failed to create soup model")
 
     output_path = Path(args.output_path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -316,17 +483,21 @@ def main():
     soup_metadata = {
         "method": args.method,
         "members": member_meta,
+        "strategy": args.strategy,
+        "n_combinations": args.n_combinations,
+        "random_seed": args.random_seed,
+        "coefficients": best_coeffs,
+        "fisher_floor": args.fisher_floor,
+        "favor_target_model": favor_target,
+        "normalize_fisher": normalize_fisher,
     }
     evaluation_summary = None
     if args.evaluate:
-        reference_args_path = run_dirs[0] / "args.json"
-        auc, scores_np, labels_np, roc_parts, ref_args = _evaluate_soup_model(
-            combined_state,
-            reference_args_path=reference_args_path,
-            device_override=args.eval_device,
-        )
+        if best_eval_payload is None:
+            raise RuntimeError("Failed to evaluate any soup combination")
+        scores_np, labels_np, roc_parts, ref_args = best_eval_payload
         eval_dir = output_path.parent / f"{output_path.stem}_eval"
-        metrics_payload = _persist_evaluation(eval_dir, auc, scores_np, labels_np, roc_parts)
+        metrics_payload = _persist_evaluation(eval_dir, best_auc, scores_np, labels_np, roc_parts)
         evaluation_summary = {
             "auc": metrics_payload["auc"],
             "num_samples": metrics_payload["num_samples"],
@@ -339,13 +510,14 @@ def main():
             "dataset": ref_args.dataset,
         }
         soup_metadata["evaluation"] = evaluation_summary
+        soup_metadata["searched_coefficients"] = search_results
 
-    if args.save_fisher and combined_fisher:
+    if args.save_fisher and best_fisher:
         fisher_output = output_path.with_suffix(".fisher.pt")
-        torch.save(combined_fisher, fisher_output)
+        torch.save(best_fisher, fisher_output)
         soup_metadata["aggregated_fisher"] = str(fisher_output)
 
-    save_soup(output_path, combined_state, soup_metadata)
+    save_soup(output_path, best_state, soup_metadata)
     save_metadata(output_path.parent, soup_metadata)
     print(f"Saved soup checkpoint to {output_path}")
     if evaluation_summary is not None:
