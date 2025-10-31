@@ -12,10 +12,11 @@ from models.STG_NF.model_pose import STG_NF
 class FisherSTGNF:
     """Fisher Information computation for STG-NF models."""
     
-    def __init__(self, model: STG_NF, device: torch.device, logger: Optional[logging.Logger] = None):
+    def __init__(self, model: STG_NF, device: torch.device, logger: Optional[logging.Logger] = None, args=None):
         self.model = model
         self.device = device
         self.logger = logger or logging.getLogger(__name__)
+        self.args = args
         
     def get_mergeable_parameters(self) -> List[torch.nn.Parameter]:
         """Get model parameters that can be merged (excluding bias and 1D parameters)."""
@@ -63,9 +64,9 @@ class FisherSTGNF:
             sample_label = labels[b:b+1]
             sample_score = scores[b:b+1]
             
-            # Compute Fisher for this sample
+            # Compute Fisher for this sample - need to pass args
             sample_fishers = self._compute_fisher_single_sample(
-                sample_data, sample_label, sample_score, variables
+                sample_data, sample_label, sample_score, variables, self.args
             )
             
             # Accumulate Fisher information
@@ -82,7 +83,8 @@ class FisherSTGNF:
     def _compute_fisher_single_sample(self, data: torch.Tensor, 
                                     labels: torch.Tensor,
                                     scores: torch.Tensor,
-                                    variables: List[torch.nn.Parameter]) -> List[torch.Tensor]:
+                                    variables: List[torch.nn.Parameter],
+                                    args) -> List[torch.Tensor]:
         """Compute Fisher Information for a single sample."""
         sample_fishers = []
         for param in variables:
@@ -93,8 +95,18 @@ class FisherSTGNF:
             param.requires_grad_(True)
         
         try:
+            # Process data same as evaluation - use only first 2 channels unless model_confidence is True
+            if getattr(args, 'model_confidence', False):
+                samp = data
+            else:
+                samp = data[:, :2]  # Only use first 2 channels
+            
             # Forward pass through STG-NF model
-            _, nll = self.model(data.float(), label=labels, score=scores)
+            _, nll = self.model(samp.float(), label=labels, score=scores)
+            
+            # Apply model_confidence weighting if enabled
+            if getattr(args, 'model_confidence', False):
+                nll = nll * scores
             
             # Use negative log-likelihood as the loss
             loss = nll.mean()

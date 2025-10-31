@@ -164,7 +164,7 @@ def compute_fisher_for_checkpoint(checkpoint_path: Path,
     model.to(device)
 
     # Initialize Fisher computation
-    fisher_computer = FisherSTGNF(model=model, device=device, logger=logger)
+    fisher_computer = FisherSTGNF(model=model, device=device, logger=logger, args=ref_args)
 
     # Prepare training loader for Fisher computation (memory-safe)
     train_loader = loader['train']
