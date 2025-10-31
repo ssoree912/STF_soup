@@ -121,7 +121,20 @@ class FisherSoupSTGNF:
                     fisher_idx = param_to_fisher_idx[name]
                     if fisher_idx < len(fishers[model_idx]):
                         fisher_diag = fishers[model_idx][fisher_idx]
-                        
+                        fisher_diag = fisher_diag.to(tensor.device, dtype=tensor.dtype)
+
+                        # Handle mismatched shapes
+                        if fisher_diag.shape != tensor.shape:
+                            if fisher_diag.numel() == tensor.numel():
+                                fisher_diag = fisher_diag.view_as(tensor)
+                            else:
+                                if self.logger:
+                                    self.logger.warning(
+                                        "Fisher shape %s mismatched with parameter %s shape %s; falling back to uniform weighting",
+                                        tuple(fisher_diag.shape), name, tuple(tensor.shape)
+                                    )
+                                fisher_diag = torch.ones_like(tensor)
+
                         # Apply normalization
                         if fisher_norms is not None:
                             fisher_diag = fisher_diag / fisher_norms[model_idx]
