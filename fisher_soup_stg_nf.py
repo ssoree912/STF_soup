@@ -268,6 +268,7 @@ class FisherSoupSTGNF:
         
         return {
             'auc': auc,
+            'roc_auc': auc,  # Alias for consistency
             'scores': scores_np,
             'labels': labels_np,
             'roc_parts': roc_parts
@@ -304,7 +305,10 @@ class FisherSoupSTGNF:
             
             result = MergeResult(
                 coefficients=coeffs, 
-                score={'auc': eval_result['auc']}
+                score={
+                    'auc': eval_result['auc'],
+                    'roc_auc': eval_result['roc_auc']
+                }
             )
             results.append(result)
             
@@ -316,8 +320,8 @@ class FisherSoupSTGNF:
             torch.cuda.empty_cache()
         
         # Find best result
-        best_result = max(results, key=lambda x: x.score['auc'])
-        self.logger.info(f"Best result - Coefficients: {best_result.coefficients}, AUC: {best_result.score['auc']:.4f}")
+        best_result = max(results, key=lambda x: x.score['roc_auc'])
+        self.logger.info(f"Best result - Coefficients: {best_result.coefficients}, ROC AUC: {best_result.score['roc_auc']:.4f}")
         
         return results
 

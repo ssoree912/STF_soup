@@ -380,9 +380,9 @@ def main():
             combined_mask=combined_mask,
             print_results=True
         )
-        best_result = max(results, key=lambda x: x.score["auc"])
+        best_result = max(results, key=lambda x: x.score["roc_auc"])
         best_coefficients = best_result.coefficients
-        logger.info("Using best coefficients: %s", best_coefficients)
+        logger.info("Using best coefficients: %s (ROC AUC: %.4f)", best_coefficients, best_result.score["roc_auc"])
     else:
         best_coefficients = coefficients_set[0]
         best_result = None
@@ -423,7 +423,8 @@ def main():
     
     if best_result is not None:
         soup_metadata["evaluation"] = {
-            "auc": float(best_result.score["auc"])
+            "auc": float(best_result.score["auc"]),
+            "roc_auc": float(best_result.score["roc_auc"])
         }
 
     payload = {
@@ -451,7 +452,7 @@ def main():
     if args.evaluate and test_loader is not None:
         final_eval = fisher_soup.evaluate_model(final_model, test_loader, dataset_test, ref_args)
         logger.info("Final merged model performance:")
-        logger.info("  AUC: %.4f", final_eval["auc"])
+        logger.info("  ROC AUC: %.4f", final_eval["roc_auc"])
 
     logger.info("Folder Fisher Soup for STG-NF completed successfully!")
 
