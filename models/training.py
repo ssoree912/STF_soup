@@ -107,8 +107,16 @@ class Trainer:
 
         path_join = os.path.join(self.args.ckpt_dir, filename)
         torch.save(state, path_join)
+        self._export_pruning_masks(path_join)
         if is_best:
-            shutil.copy(path_join, os.path.join(self.args.ckpt_dir, 'checkpoint_best.pth.tar'))
+            best_path = os.path.join(self.args.ckpt_dir, 'checkpoint_best.pth.tar')
+            shutil.copy(path_join, best_path)
+            mask_src = path_join + '.mask'
+            mask_dst = best_path + '.mask'
+            if os.path.exists(mask_src):
+                shutil.copy(mask_src, mask_dst)
+            elif os.path.exists(mask_dst):
+                os.remove(mask_dst)
 
     def load_checkpoint(self, filename):
         filename = filename
@@ -177,8 +185,7 @@ class Trainer:
                 auc = self._evaluate_auc()
                 if (self.best_auc is None) or (auc > self.best_auc):
                     self.best_auc = auc
-                    best_path = os.path.join(self.args.ckpt_dir, 'checkpoint_best.pth.tar')
-                    shutil.copy(os.path.join(self.args.ckpt_dir, checkpoint_filename), best_path)
+                    self.save_checkpoint(epoch, is_best=True, filename=checkpoint_filename)
                     print(f'New best checkpoint saved with AUC {auc * 100:.2f}%')
 
     def test(self):
@@ -269,3 +276,20 @@ class Trainer:
         auc, _, _, _ = score_dataset(normality_scores, self.test_metadata, args=self.args)
         self.model.train()
         return auc
+
+    def _export_pruning_masks(self, checkpoint_path, is_best=False):
+        mask_dict = {}
+        for module_name, module in self.model.named_modules():
+            for param_name in ['weight', 'bias']:
+                mask_attr = f"{param_name}_mask"
+                if hasattr(module, mask_attr):
+                    mask = getattr(module, mask_attr)
+                    if mask is None:
+                        continue
+                    mask_key = f"{module_name}.{param_name}" if module_name else param_name
+                    mask_dict[mask_key] = mask.detach().cpu()
+        mask_path = checkpoint_path + '.mask'
+        if mask_dict:
+            torch.save(mask_dict, mask_path)
+        elif os.path.exists(mask_path):
+            os.remove(mask_path)

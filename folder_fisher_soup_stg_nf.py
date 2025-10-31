@@ -348,7 +348,7 @@ def main():
         logger=logger
     )
 
-    fisher_soup = FisherSoupSTGNF(device, logger)
+    fisher_soup = FisherSoupSTGNF(device, logger, model_args=model_args)
     combined_mask = fisher_soup.combine_masks(masks)
     for model, mask in zip(models, masks):
         fisher_soup.apply_mask_to_model(model, mask)

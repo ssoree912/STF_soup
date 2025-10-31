@@ -1,10 +1,11 @@
+import copy
+import os
+from collections import namedtuple
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import os
-from typing import List, Dict, Tuple, Optional, Sequence
-import logging
-from collections import namedtuple
 from tqdm import tqdm
 
 from models.STG_NF.model_pose import STG_NF
@@ -16,10 +17,11 @@ MergeResult = namedtuple("MergeResult", ["coefficients", "score"])
 
 class FisherSoupSTGNF:
     """Fisher Soup implementation for STG-NF models with memory optimization."""
-    
-    def __init__(self, device: torch.device, logger: Optional[logging.Logger] = None):
+
+    def __init__(self, device: torch.device, logger: Optional[logging.Logger] = None, model_args: Optional[Dict] = None):
         self.device = device
         self.logger = logger or logging.getLogger(__name__)
+        self.model_args = copy.deepcopy(model_args) if model_args is not None else None
     
     def print_merge_result(self, result: MergeResult):
         """Print merge result in a readable format."""
@@ -159,18 +161,9 @@ class FisherSoupSTGNF:
     
     def clone_model(self, model: STG_NF) -> STG_NF:
         """Create a deep copy of the model."""
-        # Get model arguments from the original model
-        model_args = {
-            'n_blocks': getattr(model, 'n_blocks', 6),
-            'input_size': getattr(model, 'input_size', 2),
-            'hidden_size': getattr(model, 'hidden_size', 256),
-            'n_hidden': getattr(model, 'n_hidden', 1),
-            'cond_label_size': getattr(model, 'cond_label_size', 0),
-            'score_transform': getattr(model, 'score_transform', 'none'),
-        }
-        
-        # Create new model with same architecture
-        new_model = STG_NF(**model_args)
+        if self.model_args is None:
+            raise ValueError("model_args must be provided to clone STG-NF models")
+        new_model = STG_NF(**self.model_args)
         new_model.load_state_dict(model.state_dict())
         new_model.to(self.device)
         return new_model
@@ -327,11 +320,30 @@ class FisherSoupSTGNF:
         return results
 
 
-def load_models_and_fishers(checkpoint_paths: List[str], 
-                          fisher_paths: Optional[List[str]],
-                          model_args: Dict,
-                          device: torch.device,
-                          logger: Optional[logging.Logger] = None) -> Tuple[List[STG_NF], Optional[List[List[torch.Tensor]]], List[Optional[Dict[str, torch.Tensor]]]]:
+def _normalize_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    new_state: Dict[str, torch.Tensor] = {}
+    for key, value in list(state_dict.items()):
+        if key.endswith("weight_orig"):
+            base_key = key[:-len("weight_orig")] + "weight"
+            mask_key = key[:-len("weight_orig")] + "weight_mask"
+            mask_tensor = state_dict.get(mask_key)
+            if mask_tensor is None:
+                mask_tensor = torch.ones_like(value)
+            new_state[base_key] = value * mask_tensor
+        elif key.endswith("weight_mask"):
+            continue
+        elif key.endswith("actnorm.inited"):
+            new_state[key] = torch.ones_like(value) if torch.is_tensor(value) else 1
+        else:
+            new_state[key] = value
+    return new_state
+
+
+def load_models_and_fishers(checkpoint_paths: List[str],
+                            fisher_paths: Optional[List[str]],
+                            model_args: Dict,
+                            device: torch.device,
+                            logger: Optional[logging.Logger] = None) -> Tuple[List[STG_NF], Optional[List[List[torch.Tensor]]], List[Optional[Dict[str, torch.Tensor]]]]:
     """Load STG-NF models and their Fisher information."""
     if logger is None:
         logger = logging.getLogger(__name__)
@@ -346,15 +358,18 @@ def load_models_and_fishers(checkpoint_paths: List[str],
         
         model = STG_NF(**model_args)
         checkpoint = torch.load(ckpt_path, map_location="cpu")
-        
+
         if "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
         elif isinstance(checkpoint, dict):
             state_dict = checkpoint
         else:
             raise ValueError(f"Unsupported checkpoint format at {ckpt_path}")
-        
-        model.load_state_dict(state_dict)
+
+        normalized_state = _normalize_state_dict(state_dict)
+        model.load_state_dict(normalized_state, strict=False)
+        if hasattr(model, "set_actnorm_init"):
+            model.set_actnorm_init()
         model.to(device)
         models.append(model)
         
