@@ -49,6 +49,12 @@ def _load_checkpoint(checkpoint_path: Path) -> Dict[str, torch.Tensor]:
                 state[key] = torch.ones_like(tensor)
             else:
                 state[key] = 1
+        if key.endswith("weight_orig"):
+            weight_key = key.replace("weight_orig", "weight")
+            mask_key = key.replace("weight_orig", "weight_mask")
+            orig_weight = state.pop(key)
+            mask_tensor = state.pop(mask_key, torch.ones_like(orig_weight))
+            state[weight_key] = orig_weight * mask_tensor
     return state
 
 
@@ -522,7 +528,7 @@ def main():
     print(f"Saved soup checkpoint to {output_path}")
     if evaluation_summary is not None:
         print(f"Soup evaluation AUC: {evaluation_summary['auc'] * 100:.2f}% saved under {evaluation_summary['metrics_dir']}")
-    if args.save_fisher and combined_fisher:
+    if args.save_fisher and best_fisher:
         print(f"Saved aggregated fisher to {output_path.with_suffix('.fisher.pt')}")
 
 
