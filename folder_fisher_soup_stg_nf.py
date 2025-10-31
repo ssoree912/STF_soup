@@ -264,7 +264,7 @@ def parse_args() -> argparse.Namespace:
     # Checkpoint patterns
     parser.add_argument("--checkpoint_pattern", default="checkpoint_best.pth.tar",
                         help="Checkpoint filename pattern to look for.")
-    parser.add_argument("--mask_name", default="mask.pt",
+    parser.add_argument("--mask_name", default="pruning_mask.pt",
                         help="Common mask filename to look for in each folder.")
 
     return parser.parse_args()

@@ -355,7 +355,7 @@ def load_models_and_fishers(checkpoint_paths: List[str],
                             model_args: Dict,
                             device: torch.device,
                             logger: Optional[logging.Logger] = None,
-                            mask_name: str = "mask.pt") -> Tuple[List[STG_NF], Optional[List[List[torch.Tensor]]], List[Optional[Dict[str, torch.Tensor]]]]:
+                            mask_name: str = "pruning_mask.pt") -> Tuple[List[STG_NF], Optional[List[List[torch.Tensor]]], List[Optional[Dict[str, torch.Tensor]]]]:
     """Load STG-NF models and their Fisher information."""
     if logger is None:
         logger = logging.getLogger(__name__)

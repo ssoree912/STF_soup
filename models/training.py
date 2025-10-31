@@ -288,7 +288,9 @@ class Trainer:
                         continue
                     mask_key = f"{module_name}.{param_name}" if module_name else param_name
                     mask_dict[mask_key] = mask.detach().cpu()
-        mask_path = checkpoint_path + '.mask'
+        # Save mask with fixed filename instead of timestamp-based name
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        mask_path = os.path.join(checkpoint_dir, 'pruning_mask.pt')
         if mask_dict:
             torch.save(mask_dict, mask_path)
         elif os.path.exists(mask_path):
