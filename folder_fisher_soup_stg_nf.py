@@ -264,6 +264,8 @@ def parse_args() -> argparse.Namespace:
     # Checkpoint patterns
     parser.add_argument("--checkpoint_pattern", default="checkpoint_best.pth.tar",
                         help="Checkpoint filename pattern to look for.")
+    parser.add_argument("--mask_name", default="mask.pt",
+                        help="Common mask filename to look for in each folder.")
 
     return parser.parse_args()
 
@@ -345,7 +347,8 @@ def main():
         fisher_paths=[str(p) for p in computed_fisher_paths],
         model_args=model_args,
         device=device,
-        logger=logger
+        logger=logger,
+        mask_name=args.mask_name
     )
 
     fisher_soup = FisherSoupSTGNF(device, logger, model_args=model_args)

@@ -1,4 +1,5 @@
 import copy
+import logging
 import os
 from collections import namedtuple
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -161,10 +162,7 @@ class FisherSoupSTGNF:
     
     def clone_model(self, model: STG_NF) -> STG_NF:
         """Create a deep copy of the model."""
-        if self.model_args is None:
-            raise ValueError("model_args must be provided to clone STG-NF models")
-        new_model = STG_NF(**self.model_args)
-        new_model.load_state_dict(model.state_dict())
+        new_model = copy.deepcopy(model)
         new_model.to(self.device)
         return new_model
     
@@ -343,7 +341,8 @@ def load_models_and_fishers(checkpoint_paths: List[str],
                             fisher_paths: Optional[List[str]],
                             model_args: Dict,
                             device: torch.device,
-                            logger: Optional[logging.Logger] = None) -> Tuple[List[STG_NF], Optional[List[List[torch.Tensor]]], List[Optional[Dict[str, torch.Tensor]]]]:
+                            logger: Optional[logging.Logger] = None,
+                            mask_name: str = "mask.pt") -> Tuple[List[STG_NF], Optional[List[List[torch.Tensor]]], List[Optional[Dict[str, torch.Tensor]]]]:
     """Load STG-NF models and their Fisher information."""
     if logger is None:
         logger = logging.getLogger(__name__)
@@ -373,9 +372,11 @@ def load_models_and_fishers(checkpoint_paths: List[str],
         model.to(device)
         models.append(model)
         
-        # Load mask if exists
-        mask_path = ckpt_path + ".mask"
-        if os.path.exists(mask_path):
+        # Load mask using common filename
+        ckpt_dir = os.path.dirname(ckpt_path)
+        mask_path = os.path.join(ckpt_dir, mask_name)
+        
+        if mask_path and os.path.exists(mask_path):
             try:
                 raw_mask_dict = torch.load(mask_path, map_location='cpu')
                 bool_mask = {key: (tensor != 0).to(torch.bool) for key, tensor in raw_mask_dict.items()}
@@ -385,6 +386,7 @@ def load_models_and_fishers(checkpoint_paths: List[str],
                 logger.warning(f"Failed to load mask from {mask_path}: {e}")
                 masks.append(None)
         else:
+            logger.info(f"No mask file found for {ckpt_path}")
             masks.append(None)
     
     # Load Fisher information if provided
