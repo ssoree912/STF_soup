@@ -387,18 +387,23 @@ def load_models_and_fishers(checkpoint_paths: List[str],
         
         # Load mask using common filename
         ckpt_dir = os.path.dirname(ckpt_path)
-        mask_path = os.path.join(ckpt_dir, mask_name)
-        
-        if mask_path and os.path.exists(mask_path):
-            try:
-                raw_mask_dict = torch.load(mask_path, map_location='cpu')
-                bool_mask = {key: (tensor != 0).to(torch.bool) for key, tensor in raw_mask_dict.items()}
-                masks.append(bool_mask)
-                logger.info(f"Loaded pruning mask from {mask_path}")
-            except Exception as e:
-                logger.warning(f"Failed to load mask from {mask_path}: {e}")
-                masks.append(None)
-        else:
+        candidate_paths = [ckpt_path + ".mask"]
+        if mask_name:
+            candidate_paths.append(os.path.join(ckpt_dir, mask_name))
+
+        mask_loaded = False
+        for mask_path in candidate_paths:
+            if mask_path and os.path.exists(mask_path):
+                try:
+                    raw_mask_dict = torch.load(mask_path, map_location='cpu')
+                    bool_mask = {key: (tensor != 0).to(torch.bool) for key, tensor in raw_mask_dict.items()}
+                    masks.append(bool_mask)
+                    logger.info(f"Loaded pruning mask from {mask_path}")
+                    mask_loaded = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to load mask from {mask_path}: {e}")
+        if not mask_loaded:
             logger.info(f"No mask file found for {ckpt_path}")
             masks.append(None)
     

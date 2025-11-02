@@ -77,6 +77,7 @@ class Trainer:
         self._pruned_params = []
         self.pruning_applied = False
         self.best_auc = None
+        self._last_mask_snapshot = None
 
     def get_optimizer(self):
         if self.args.optimizer == 'adam':
@@ -262,6 +263,7 @@ class Trainer:
             return
         if (epoch + 1) < self.unprune_epoch:
             return
+        self._last_mask_snapshot = self._gather_masks_from_model()
         for module, _ in self._pruned_params:
             try:
                 prune.remove(module, 'weight')
@@ -278,6 +280,19 @@ class Trainer:
         return auc
 
     def _export_pruning_masks(self, checkpoint_path, is_best=False):
+        mask_dict = self._gather_masks_from_model()
+        if not mask_dict and self._last_mask_snapshot:
+            mask_dict = {k: v.clone() for k, v in self._last_mask_snapshot.items()}
+
+        mask_path = checkpoint_path + '.mask'
+        if mask_dict:
+            torch.save(mask_dict, mask_path)
+            self._last_mask_snapshot = {k: v.clone() for k, v in mask_dict.items()}
+        elif os.path.exists(mask_path):
+            os.remove(mask_path)
+            self._last_mask_snapshot = None
+
+    def _gather_masks_from_model(self):
         mask_dict = {}
         for module_name, module in self.model.named_modules():
             for param_name in ['weight', 'bias']:
@@ -286,12 +301,6 @@ class Trainer:
                     mask = getattr(module, mask_attr)
                     if mask is None:
                         continue
-                    mask_key = f"{module_name}.{param_name}" if module_name else param_name
-                    mask_dict[mask_key] = mask.detach().cpu()
-        # Save mask with fixed filename instead of timestamp-based name
-        checkpoint_dir = os.path.dirname(checkpoint_path)
-        mask_path = os.path.join(checkpoint_dir, 'pruning_mask.pt')
-        if mask_dict:
-            torch.save(mask_dict, mask_path)
-        elif os.path.exists(mask_path):
-            os.remove(mask_path)
+                    key = f"{module_name}.{param_name}" if module_name else param_name
+                    mask_dict[key] = mask.detach().cpu().to(torch.float32)
+        return mask_dict
