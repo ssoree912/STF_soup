@@ -59,10 +59,8 @@ class FisherSoupSTGNF:
         """Check if parameter should be skipped during merging."""
         if name.endswith("actnorm.inited"):
             return True
-        if tensor.ndim <= 1:
-            return True
-        if any(token in name for token in [".actnorm.", "running_mean", "running_var", 
-                                          "num_batches_tracked", "prior_h"]):
+        banned_tokens = (".actnorm.", "running_mean", "running_var", "num_batches_tracked", "prior_h")
+        if any(token in name for token in banned_tokens):
             return True
         return False
     
@@ -87,11 +85,6 @@ class FisherSoupSTGNF:
         
         # Normalize Fisher information if requested
         fisher_norms = None
-        if normalize_fishers and fishers is not None:
-            fisher_norms = []
-            for fisher_list in fishers:
-                norm_const = torch.sqrt(sum(torch.sum(f ** 2) for f in fisher_list))
-                fisher_norms.append(norm_const)
         
         # Map parameter names to Fisher indices
         param_to_fisher_idx = {}
@@ -123,7 +116,7 @@ class FisherSoupSTGNF:
                         fisher_diag = fishers[model_idx][fisher_idx]
                         fisher_diag = fisher_diag.to(tensor.device, dtype=tensor.dtype)
 
-                        # Handle mismatched shapes
+                        # Handle mismatched shapes.
                         if fisher_diag.shape != tensor.shape:
                             if fisher_diag.numel() == tensor.numel():
                                 fisher_diag = fisher_diag.view_as(tensor)
@@ -135,7 +128,12 @@ class FisherSoupSTGNF:
                                     )
                                 fisher_diag = torch.ones_like(tensor)
 
-                        # Apply normalization
+                        # Per-tensor Fisher normalization and clamp
+                        f_abs = fisher_diag.abs()
+                        scale = f_abs.mean().clamp_min(1e-8)
+                        fisher_diag = (f_abs / scale).clamp_min(1e-8)
+
+                        # Optional global normalization per model
                         if fisher_norms is not None:
                             fisher_diag = fisher_diag / fisher_norms[model_idx]
                 
@@ -170,7 +168,8 @@ class FisherSoupSTGNF:
             self.apply_mask_to_state_dict(output_state, combined_mask)
         
         # Load the merged state dict
-        output_model.load_state_dict(output_state)
+        output_model.load_state_dict(output_state, strict=False)
+        self._stabilize_model(output_model)
         return output_model
     
     def clone_model(self, model: STG_NF) -> STG_NF:
@@ -198,6 +197,18 @@ class FisherSoupSTGNF:
         if not has_mask:
             return None
         return combined
+
+    def _stabilize_model(self, model: STG_NF, sigma_min: float = 1e-3) -> None:
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.ndim == 2 and param.shape[0] == param.shape[1]:
+                    lname = name.lower()
+                    if any(token in lname for token in ("invconv", "invertible", "1x1", "conv1x1")):
+                        u, s, vh = torch.linalg.svd(param.data, full_matrices=False)
+                        s = s.clamp_min(sigma_min)
+                        param.copy_((u @ torch.diag(s) @ vh).to(param.dtype))
+        if hasattr(model, "set_actnorm_init"):
+            model.set_actnorm_init()
     
     def apply_mask_to_state_dict(self, state_dict: Dict[str, torch.Tensor], 
                                 mask: Optional[Dict[str, torch.Tensor]]):

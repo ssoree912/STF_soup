@@ -266,6 +266,8 @@ def parse_args() -> argparse.Namespace:
                         help="Checkpoint filename pattern to look for.")
     parser.add_argument("--mask_name", default="pruning_mask.pt",
                         help="Common mask filename to look for in each folder.")
+    parser.add_argument("--apply_masks", action="store_true", default=False,
+                        help="Apply pruning masks during soup (default: False for dense soup)")
 
     return parser.parse_args()
 
@@ -352,9 +354,11 @@ def main():
     )
 
     fisher_soup = FisherSoupSTGNF(device, logger, model_args=model_args)
-    combined_mask = fisher_soup.combine_masks(masks)
-    for model, mask in zip(models, masks):
-        fisher_soup.apply_mask_to_model(model, mask)
+    combined_mask = None
+    if args.apply_masks:
+        combined_mask = fisher_soup.combine_masks(masks)
+        for model, mask in zip(models, masks):
+            fisher_soup.apply_mask_to_model(model, mask)
 
     # Generate coefficient combinations
     coefficients_set = generate_coefficients(
