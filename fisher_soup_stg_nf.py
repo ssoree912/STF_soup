@@ -85,17 +85,9 @@ class FisherSoupSTGNF:
         # Get state dicts from all models
         model_states = [model.state_dict() for model in models]
         
-        # Normalize Fisher information if requested
-        fisher_norms = None
-        
-        # Map parameter names to Fisher indices
-        param_to_fisher_idx = {}
-        if fishers is not None:
-            fisher_idx = 0
-            for name, tensor in output_state.items():
-                if not self._should_skip_parameter(name, tensor):
-                    param_to_fisher_idx[name] = fisher_idx
-                    fisher_idx += 1
+        gamma = getattr(self, "fisher_gamma", 0.75)
+        clip_quantile = getattr(self, "fisher_clip_quantile", 0.995)
+        fisher_floor = max(fisher_floor, 1e-8)
         
         # Merge each parameter
         for name, output_tensor in output_state.items():
@@ -110,40 +102,46 @@ class FisherSoupSTGNF:
             denominator = None
             
             for model_idx, (tensor, coeff) in enumerate(zip(tensors, coefficients)):
-                # Get Fisher information for this parameter
-                fisher_diag = 1.0
-                if fishers is not None and name in param_to_fisher_idx:
-                    fisher_idx = param_to_fisher_idx[name]
-                    if fisher_idx < len(fishers[model_idx]):
-                        fisher_diag = fishers[model_idx][fisher_idx]
-                        fisher_diag = fisher_diag.to(tensor.device, dtype=tensor.dtype)
+                fisher_tensor = None
+                if fishers is not None and model_idx < len(fishers) and fishers[model_idx]:
+                    fisher_tensor = fishers[model_idx].get(name)
 
-                        # Handle mismatched shapes
-                        if fisher_diag.shape != tensor.shape:
-                            if fisher_diag.numel() == tensor.numel():
-                                fisher_diag = fisher_diag.view_as(tensor)
-                            else:
-                                if self.logger:
-                                    self.logger.warning(
-                                        "Fisher shape %s mismatched with parameter %s shape %s; falling back to uniform weighting",
-                                        tuple(fisher_diag.shape), name, tuple(tensor.shape)
-                                    )
-                                fisher_diag = torch.ones_like(tensor)
+                if fisher_tensor is None:
+                    fisher_tensor = torch.ones_like(tensor, device=tensor.device, dtype=tensor.dtype)
+                else:
+                    fisher_tensor = fisher_tensor.to(tensor.device, dtype=tensor.dtype)
+                    if fisher_tensor.shape != tensor.shape:
+                        if fisher_tensor.numel() == tensor.numel():
+                            fisher_tensor = fisher_tensor.view_as(tensor)
+                        else:
+                            if self.logger:
+                                self.logger.warning(
+                                    "Fisher shape %s mismatched with parameter %s shape %s; falling back to uniform weighting",
+                                    tuple(fisher_tensor.shape), name, tuple(tensor.shape)
+                                )
+                            fisher_tensor = torch.ones_like(tensor, device=tensor.device, dtype=tensor.dtype)
 
-                        # Apply normalization
-                        # No global normalization
-                
-                # Apply fisher floor (except for target model if favor_target_model is True)
+                    f_abs = fisher_tensor.abs()
+                    scale = f_abs.mean().clamp_min(1e-8)
+                    fisher_tensor = (f_abs / scale).pow(gamma)
+                    if clip_quantile is not None and 0.0 < clip_quantile < 1.0 and fisher_tensor.numel() > 1:
+                        q = torch.quantile(fisher_tensor.detach().flatten(), float(clip_quantile))
+                        fisher_tensor = torch.clamp(fisher_tensor, max=q)
+                    fisher_tensor = torch.clamp(fisher_tensor, min=fisher_floor)
+
                 if not favor_target_model or model_idx != 0:
-                    if isinstance(fisher_diag, torch.Tensor):
-                        fisher_diag = torch.clamp(fisher_diag, min=fisher_floor)
-                    else:
-                        fisher_diag = max(fisher_diag, fisher_floor)
-                
-                # Compute weighted terms
-                weight = coeff * fisher_diag
+                    fisher_tensor = torch.clamp(fisher_tensor, min=fisher_floor)
+
+                if fisher_tensor.ndim == 0:
+                    fisher_tensor = fisher_tensor.expand_as(tensor)
+
+                weight = coeff * fisher_tensor
+                if not isinstance(weight, torch.Tensor):
+                    weight = torch.tensor(weight, dtype=tensor.dtype, device=tensor.device)
+                if weight.ndim == 0:
+                    weight = weight.expand_as(tensor)
                 contrib = tensor * weight
-                
+
                 if numerator is None:
                     numerator = contrib
                     denominator = weight
@@ -152,12 +150,7 @@ class FisherSoupSTGNF:
                     denominator = denominator + weight
             
             # Update output parameter
-            if isinstance(denominator, torch.Tensor):
-                denominator = torch.clamp(denominator, min=1e-12)
-            else:
-                denominator = max(denominator, 1e-12)
-                
-            output_state[name] = numerator / denominator
+            output_state[name] = numerator / denominator.clamp_min(1e-12)
         
         # Apply combined mask if provided
         if combined_mask is not None:
