@@ -56,20 +56,54 @@ class FisherSoupSTGNF:
         return coefficients
     
     def _should_skip_parameter(self, name: str, tensor: torch.Tensor) -> bool:
-        """Check if parameter should be skipped during merging."""
+        """Decide whether to skip a parameter during merging.
+
+        We no longer skip 1D parameters (e.g., bias) so they are merged too.
+        """
         if name.endswith("actnorm.inited"):
             return True
-        if tensor.ndim <= 1:
-            return True
-        if any(token in name for token in [".actnorm.", "running_mean", "running_var", 
-                                          "num_batches_tracked", "prior_h"]):
+        if any(token in name for token in [".actnorm.", "running_mean", "running_var",
+                                           "num_batches_tracked", "prior_h"]):
             return True
         return False
+    
+    def _project_invertible(self, weight: torch.Tensor, sigma_min: float = 1e-3) -> torch.Tensor:
+        """Project a square weight matrix back onto the invertible manifold."""
+        # torch.linalg.svd expects floating types; computations happen in-place on the same device
+        weight_detached = weight.detach()
+        original_dtype = weight_detached.dtype
+        work_tensor = weight_detached
+        if work_tensor.dtype not in (torch.float32, torch.float64):
+            work_tensor = work_tensor.to(torch.float32)
+
+        U, S, Vh = torch.linalg.svd(work_tensor, full_matrices=False)
+        S = S.clamp_min(sigma_min)
+        projected = U @ torch.diag(S) @ Vh
+        return projected.to(device=weight_detached.device, dtype=original_dtype)
+
+    def _stabilize_after_merge(self, model: STG_NF, sigma_min: float = 1e-3) -> None:
+        """Stabilize merged model by reprojecting invertible layers and reinitializing ActNorm."""
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                name_lower = name.lower()
+                # Handle square 2D matrices (common for invertible 1x1 conv represented as [C, C])
+                if param.ndim == 2 and param.shape[0] == param.shape[1]:
+                    if any(token in name_lower for token in ("invconv", "invertible", "1x1", "conv1x1")):
+                        param.copy_(self._project_invertible(param.data, sigma_min=sigma_min))
+                # Handle 1x1 conv stored as 4D [C, C, 1, 1]
+                elif param.ndim == 4 and param.shape[2:] == (1, 1) and param.shape[0] == param.shape[1]:
+                    if any(token in name_lower for token in ("invconv", "invertible", "1x1", "conv1x1")):
+                        flat = param.data.flatten(2).squeeze(-1)  # [C, C]
+                        proj = self._project_invertible(flat, sigma_min=sigma_min)
+                        param.copy_(proj.view_as(param))
+
+        if hasattr(model, "set_actnorm_init"):
+            model.set_actnorm_init()
     
     def _merge_with_coeffs(self, 
                           models: List[STG_NF],
                           coefficients: Sequence[float],
-                          fishers: Optional[List[List[torch.Tensor]]] = None,
+                          fishers: Optional[List[Dict[str, torch.Tensor]]] = None,
                           fisher_floor: float = 1e-6,
                           favor_target_model: bool = True,
                           normalize_fishers: bool = True,
@@ -157,7 +191,8 @@ class FisherSoupSTGNF:
             self.apply_mask_to_state_dict(output_state, combined_mask)
         
         # Load the merged state dict
-        output_model.load_state_dict(output_state)
+        output_model.load_state_dict(output_state, strict=False)
+        self._stabilize_after_merge(output_model)
         return output_model
     
     def clone_model(self, model: STG_NF) -> STG_NF:
@@ -214,7 +249,7 @@ class FisherSoupSTGNF:
     def generate_merged_for_coeffs_set(self,
                                      models: List[STG_NF],
                                      coefficients_set: Sequence[Sequence[float]],
-                                     fishers: Optional[List[List[torch.Tensor]]] = None,
+                                     fishers: Optional[List[Dict[str, torch.Tensor]]] = None,
                                      fisher_floor: float = 1e-6,
                                      favor_target_model: bool = True,
                                      normalize_fishers: bool = True,
@@ -272,7 +307,7 @@ class FisherSoupSTGNF:
                                   test_loader,
                                   dataset_test,
                                   args,
-                                  fishers: Optional[List[List[torch.Tensor]]] = None,
+                                  fishers: Optional[List[Dict[str, torch.Tensor]]] = None,
                                   fisher_floor: float = 1e-6,
                                   favor_target_model: bool = True,
                                   normalize_fishers: bool = True,
@@ -337,12 +372,47 @@ def _normalize_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torc
     return new_state
 
 
+# Helper to convert Fisher lists (ordered by mergeable parameters) to dict keyed by param name
+def _map_fisher_list_to_named_params(model: STG_NF,
+                                     fisher_list: List[torch.Tensor],
+                                     logger: Optional[logging.Logger] = None) -> Dict[str, torch.Tensor]:
+    """
+    Map a Fisher list (computed over mergeable params, typically excluding 1D like bias)
+    onto the model's named parameters. Parameters not present in the list (e.g., bias)
+    will simply not get an entry and will fall back to uniform weighting during merge.
+    """
+    def _skip_for_fisher(name: str, param: torch.Tensor) -> bool:
+        if ".actnorm." in name or name.endswith("actnorm.inited"):
+            return True
+        if any(s in name for s in ["running_mean", "running_var", "num_batches_tracked"]):
+            return True
+        if "prior_h" in name:
+            return True
+        if param.dim() <= 1:
+            return True
+        return False
+
+    fdict: Dict[str, torch.Tensor] = {}
+    idx = 0
+    for n, p in model.named_parameters():
+        if _skip_for_fisher(n, p):
+            continue
+        if idx >= len(fisher_list):
+            break
+        fdict[n] = fisher_list[idx].to(p.device, dtype=p.dtype)
+        idx += 1
+    if logger is not None and idx != len(fisher_list):
+        logger.warning("Fisher list length (%d) did not match counted mergeable params (%d). "
+                       "Remaining entries will be ignored.", len(fisher_list), idx)
+    return fdict
+
+
 def load_models_and_fishers(checkpoint_paths: List[str],
                             fisher_paths: Optional[List[str]],
                             model_args: Dict,
                             device: torch.device,
                             logger: Optional[logging.Logger] = None,
-                            mask_name: str = "pruning_mask.pt") -> Tuple[List[STG_NF], Optional[List[List[torch.Tensor]]], List[Optional[Dict[str, torch.Tensor]]]]:
+                            mask_name: str = "pruning_mask.pt") -> Tuple[List[STG_NF], Optional[List[Dict[str, torch.Tensor]]], List[Optional[Dict[str, torch.Tensor]]]]:
     """Load STG-NF models and their Fisher information."""
     if logger is None:
         logger = logging.getLogger(__name__)
@@ -397,7 +467,16 @@ def load_models_and_fishers(checkpoint_paths: List[str],
         for i, fisher_path in enumerate(fisher_paths):
             logger.info(f"Loading Fisher info {i+1}/{len(fisher_paths)}: {fisher_path}")
             try:
-                fisher_dict = load_fisher_info(fisher_path, device=device, logger=logger)
+                fisher_obj = load_fisher_info(fisher_path, device=device, logger=logger)
+                if isinstance(fisher_obj, list):
+                    fisher_dict = _map_fisher_list_to_named_params(models[i], fisher_obj, logger=logger)
+                elif isinstance(fisher_obj, dict):
+                    # Ensure tensors are on correct device/dtype
+                    fisher_dict = {k: v.to(models[i].device if hasattr(models[i], "device") else device) 
+                                   if isinstance(v, torch.Tensor) else v
+                                   for k, v in fisher_obj.items()}
+                else:
+                    fisher_dict = {}
             except Exception as exc:
                 logger.warning(f"Failed to load fisher info from {fisher_path}: {exc}; falling back to uniform")
                 fisher_dict = {}

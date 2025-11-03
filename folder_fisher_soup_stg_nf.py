@@ -261,6 +261,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_subset", type=int, default=0, 
                         help="Use at most this many samples for evaluation (0 = use all).")
 
+    # Mask/evaluation behavior
+    parser.add_argument("--apply_masks_during_eval", action="store_true",
+                        help="If set, apply individual pruning masks to each source model during coefficient search/evaluation. "
+                             "By default, masks are applied only to the final merged model.")
+
+    # Fisher weighting hyperparameters (must be supported by FisherSoupSTGNF)
+    parser.add_argument("--fisher_gamma", type=float, default=0.75,
+                        help="Exponent for Fisher reweighting (e.g., 0.5 ~ 1.0).")
+    parser.add_argument("--fisher_clip_quantile", type=float, default=0.995,
+                        help="Quantile for clipping Fisher magnitudes (e.g., 0.99, 0.995, 0.997).")
+
+    # Stabilization hyperparameter for invertible layers (if supported)
+    parser.add_argument("--stabilize_sigma_min", type=float, default=1e-3,
+                        help="Minimum singular value used when reprojecting invertible layers.")
+
     # Checkpoint patterns
     parser.add_argument("--checkpoint_pattern", default="checkpoint_best.pth.tar",
                         help="Checkpoint filename pattern to look for.")
@@ -325,7 +340,7 @@ def main():
     # Load reference arguments
     reference_args = load_reference_args(reference_args_path)
     if args.device:
-        reference_args.device = device.type
+        reference_args.device = str(device)
     
     # Compute Fisher information for all checkpoints
     logger.info("Computing Fisher information for all checkpoints...")
@@ -353,8 +368,20 @@ def main():
 
     fisher_soup = FisherSoupSTGNF(device, logger, model_args=model_args)
     combined_mask = fisher_soup.combine_masks(masks)
-    for model, mask in zip(models, masks):
-        fisher_soup.apply_mask_to_model(model, mask)
+
+    # Propagate CLI hyperparameters into FisherSoupSTGNF (if supported)
+    if hasattr(fisher_soup, "__dict__"):
+        setattr(fisher_soup, "fisher_gamma", getattr(args, "fisher_gamma", 0.75))
+        setattr(fisher_soup, "fisher_clip_quantile", getattr(args, "fisher_clip_quantile", 0.995))
+        setattr(fisher_soup, "stabilize_sigma_min", getattr(args, "stabilize_sigma_min", 1e-3))
+
+    # By default, do NOT apply individual masks during evaluation; only apply to final merged model.
+    if args.apply_masks_during_eval:
+        for model, mask in zip(models, masks):
+            fisher_soup.apply_mask_to_model(model, mask)
+        logger.info("Applied individual masks to models during evaluation.")
+    else:
+        logger.info("Evaluation without applying individual masks; combined mask will be applied to the final soup only.")
 
     # Generate coefficient combinations
     coefficients_set = generate_coefficients(
@@ -399,7 +426,7 @@ def main():
             fisher_floor=args.fisher_floor,
             favor_target_model=not args.no_favor_target,
             normalize_fishers=not args.no_normalize_fishers,
-            combined_mask=combined_mask,
+            combined_mask=combined_mask if args.apply_masks_during_eval else None,
             print_results=True
         )
         best_result = max(results, key=lambda x: x.score["roc_auc"])
@@ -421,6 +448,7 @@ def main():
         combined_mask=combined_mask
     )
     _, final_model = next(merged_models)
+    logger.info("Applying combined mask to the final merged model.")
     fisher_soup.apply_mask_to_model(final_model, combined_mask)
 
     # Save merged model
