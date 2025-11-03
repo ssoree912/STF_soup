@@ -10,7 +10,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from models.STG_NF.model_pose import STG_NF
-from fisher_stg_nf import FisherSTGNF
+from fisher_stg_nf import FisherSTGNF, load_fisher_info
 from utils.scoring_utils import score_dataset
 
 MergeResult = namedtuple("MergeResult", ["coefficients", "score"])
@@ -87,11 +87,6 @@ class FisherSoupSTGNF:
         
         # Normalize Fisher information if requested
         fisher_norms = None
-        if normalize_fishers and fishers is not None:
-            fisher_norms = []
-            for fisher_list in fishers:
-                norm_const = torch.sqrt(sum(torch.sum(f ** 2) for f in fisher_list))
-                fisher_norms.append(norm_const)
         
         # Map parameter names to Fisher indices
         param_to_fisher_idx = {}
@@ -136,8 +131,7 @@ class FisherSoupSTGNF:
                                 fisher_diag = torch.ones_like(tensor)
 
                         # Apply normalization
-                        if fisher_norms is not None:
-                            fisher_diag = fisher_diag / fisher_norms[model_idx]
+                        # No global normalization
                 
                 # Apply fisher floor (except for target model if favor_target_model is True)
                 if not favor_target_model or model_idx != 0:
@@ -409,7 +403,11 @@ def load_models_and_fishers(checkpoint_paths: List[str],
         
         for i, fisher_path in enumerate(fisher_paths):
             logger.info(f"Loading Fisher info {i+1}/{len(fisher_paths)}: {fisher_path}")
-            fisher_list = torch.load(fisher_path, map_location=device)
-            fishers.append(fisher_list)
+            try:
+                fisher_dict = load_fisher_info(fisher_path, device=device, logger=logger)
+            except Exception as exc:
+                logger.warning(f"Failed to load fisher info from {fisher_path}: {exc}; falling back to uniform")
+                fisher_dict = {}
+            fishers.append(fisher_dict)
     
     return models, fishers, masks

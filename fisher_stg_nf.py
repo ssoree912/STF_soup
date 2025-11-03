@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 import logging
 from tqdm import tqdm
 
@@ -18,82 +18,82 @@ class FisherSTGNF:
         self.logger = logger or logging.getLogger(__name__)
         self.args = args
         
-    def get_mergeable_parameters(self) -> List[torch.nn.Parameter]:
-        """Get model parameters that can be merged (excluding bias and 1D parameters)."""
-        mergeable_params = []
+    def _mergeable_name_param(self) -> List[Tuple[str, torch.nn.Parameter]]:
+        pairs: List[Tuple[str, torch.nn.Parameter]] = []
         for name, param in self.model.named_parameters():
-            if param.requires_grad and param.dim() > 1:
-                mergeable_params.append(param)
-        return mergeable_params
+            if (not param.requires_grad) or self._should_skip_parameter(name, param):
+                continue
+            pairs.append((name, param))
+        return pairs
     
     def _should_skip_parameter(self, name: str, param: torch.Tensor) -> bool:
         """Check if parameter should be skipped for Fisher computation."""
-        # Skip actnorm related parameters
-        if ".actnorm." in name:
-            return True
         if name.endswith("actnorm.inited"):
             return True
-        # Skip running statistics
-        if any(skip in name for skip in ["running_mean", "running_var", "num_batches_tracked"]):
-            return True
-        # Skip 1D parameters (bias, etc.)
-        if param.dim() <= 1:
-            return True
-        # Skip prior parameters
-        if "prior_h" in name:
+        banned_tokens = (".actnorm.", "running_mean", "running_var", "num_batches_tracked")
+        if any(token in name for token in banned_tokens):
             return True
         return False
     
-    def _compute_fisher_for_batch(self, batch_data: Tuple, variables: List[torch.nn.Parameter]) -> List[torch.Tensor]:
+    def _compute_fisher_for_batch(self, batch_data: Tuple,
+                                  name_param: List[Tuple[str, torch.nn.Parameter]]) -> Dict[str, torch.Tensor]:
         """Compute Fisher Information for a single batch."""
         data, labels, scores = batch_data[:3]
-        
+
         # Move to device
         data = data.to(self.device, non_blocking=True)
-        labels = labels.to(self.device, non_blocking=True)  
+        labels = labels.to(self.device, non_blocking=True)
         scores = scores.to(self.device, non_blocking=True)
-        
         batch_size = data.shape[0]
-        batch_fishers = []
-        for param in variables:
-            batch_fishers.append(torch.zeros_like(param, device=self.device))
-        
-        # Process each sample in the batch
-        for b in range(batch_size):
-            sample_data = data[b:b+1]  # Keep batch dimension
+
+        fisher_dict = {name: torch.zeros_like(param, device=self.device)
+                       for name, param in name_param}
+
+        # Optional filtering: keep only "clean" (low-score) samples
+        clean_quantile = getattr(self.args, 'fisher_clean_quantile', None) if self.args else None
+        keep_indices = torch.arange(batch_size, device=self.device)
+        if clean_quantile is not None and 0.0 < clean_quantile < 1.0:
+            flat_scores = scores.view(batch_size, -1).mean(dim=1)
+            thresh = torch.quantile(flat_scores.detach(), float(clean_quantile))
+            keep_mask = flat_scores <= thresh
+            if keep_mask.any():
+                keep_indices = keep_indices[keep_mask]
+            else:
+                keep_indices = keep_indices[:0]
+
+        if keep_indices.numel() == 0:
+            return fisher_dict
+
+        for b in keep_indices.tolist():
+            sample_data = data[b:b+1]
             sample_label = labels[b:b+1]
             sample_score = scores[b:b+1]
-            
-            # Compute Fisher for this sample - need to pass args
+
             sample_fishers = self._compute_fisher_single_sample(
-                sample_data, sample_label, sample_score, variables, self.args
+                sample_data, sample_label, sample_score, name_param, self.args
             )
-            
-            # Accumulate Fisher information
-            for i, fisher in enumerate(sample_fishers):
-                if fisher is not None:
-                    batch_fishers[i] += fisher
-        
-        # Average over batch size
-        for fisher in batch_fishers:
-            fisher /= batch_size
-            
-        return batch_fishers
+
+            for name in fisher_dict:
+                fisher_dict[name] += sample_fishers[name]
+
+        for name in fisher_dict:
+            fisher_dict[name] /= max(keep_indices.numel(), 1)
+
+        return fisher_dict
     
-    def _compute_fisher_single_sample(self, data: torch.Tensor, 
-                                    labels: torch.Tensor,
-                                    scores: torch.Tensor,
-                                    variables: List[torch.nn.Parameter],
-                                    args) -> List[torch.Tensor]:
+    def _compute_fisher_single_sample(self, data: torch.Tensor,
+                                      labels: torch.Tensor,
+                                      scores: torch.Tensor,
+                                      name_param: List[Tuple[str, torch.nn.Parameter]],
+                                      args) -> Dict[str, torch.Tensor]:
         """Compute Fisher Information for a single sample."""
-        sample_fishers = []
-        for param in variables:
-            sample_fishers.append(torch.zeros_like(param, device=self.device))
-        
-        # Enable gradients for Fisher computation
+        sample_fishers = {name: torch.zeros_like(param, device=self.device)
+                          for name, param in name_param}
+
+        variables = [param for _, param in name_param]
         for param in variables:
             param.requires_grad_(True)
-        
+
         try:
             # Process data same as evaluation - use only first 2 channels unless model_confidence is True
             if getattr(args, 'model_confidence', False):
@@ -119,37 +119,35 @@ class FisherSTGNF:
                 create_graph=False,
                 allow_unused=True
             )
-            
+
             # Accumulate squared gradients (Fisher Information)
-            for i, grad in enumerate(grads):
+            for (name, _), grad in zip(name_param, grads):
                 if grad is not None:
-                    sample_fishers[i] = grad ** 2
+                    sample_fishers[name] = grad ** 2
                 else:
-                    sample_fishers[i] = torch.zeros_like(variables[i], device=self.device)
-                    
+                    sample_fishers[name] = torch.zeros_like(sample_fishers[name], device=self.device)
+
         except RuntimeError as e:
             self.logger.warning(f"Error computing Fisher for sample: {e}")
             # Return zero Fisher if computation fails
-            for i, param in enumerate(variables):
-                sample_fishers[i] = torch.zeros_like(param, device=self.device)
-        
+            for name, param in name_param:
+                sample_fishers[name] = torch.zeros_like(param, device=self.device)
+
         return sample_fishers
-    
-    def compute_fisher_for_model(self, dataloader, max_batches: int = 100) -> List[torch.Tensor]:
+
+    def compute_fisher_for_model(self, dataloader, max_batches: int = 100) -> Dict[str, torch.Tensor]:
         """Compute Fisher Information Matrix for the entire model."""
         self.logger.info("Computing Fisher Information Matrix for STG-NF model...")
-        
-        variables = self.get_mergeable_parameters()
-        self.logger.info(f"Found {len(variables)} mergeable parameters")
-        
-        # Initialize Fisher accumulators
-        fishers = []
-        for param in variables:
-            fishers.append(torch.zeros_like(param, device=self.device))
-        
+
+        name_param = self._mergeable_name_param()
+        self.logger.info(f"Found {len(name_param)} mergeable parameters")
+
+        fishers = {name: torch.zeros_like(param, device=self.device)
+                   for name, param in name_param}
+
         self.model.eval()
         n_batches = 0
-        
+
         # Process data in batches
         for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Computing Fisher", leave=False)):
             if batch_idx >= max_batches:
@@ -157,14 +155,13 @@ class FisherSTGNF:
                 break
                 
             try:
-                batch_fishers = self._compute_fisher_for_batch(batch_data, variables)
-                
-                # Accumulate Fisher information
-                for i, batch_fisher in enumerate(batch_fishers):
-                    fishers[i] += batch_fisher.detach()
-                
+                batch_fishers = self._compute_fisher_for_batch(batch_data, name_param)
+
+                for name in fishers:
+                    fishers[name] += batch_fishers[name].detach()
+
                 n_batches += 1
-                
+
                 # Clear cache periodically
                 if batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
@@ -179,31 +176,27 @@ class FisherSTGNF:
         
         # Average over all batches
         if n_batches > 0:
-            for fisher in fishers:
-                fisher /= n_batches
-        
+            for name in fishers:
+                fishers[name] /= n_batches
+
         self.logger.info(f"Fisher computation completed. Processed {n_batches} batches.")
         return fishers
 
 
-def save_fisher_info(fishers: List[torch.Tensor], save_path: str, 
-                    logger: Optional[logging.Logger] = None):
-    """Save Fisher Information to disk."""
+def save_fisher_info(fishers: Dict[str, torch.Tensor], save_path: str,
+                     logger: Optional[logging.Logger] = None):
     if logger is None:
         logger = logging.getLogger(__name__)
-    
-    # Convert to CPU and save as list
-    fisher_list = [fisher.cpu() for fisher in fishers]
-    torch.save(fisher_list, save_path)
+    payload = {name: tensor.cpu() for name, tensor in fishers.items()}
+    torch.save(payload, save_path)
     logger.info(f"Saved Fisher Information to {save_path}")
 
 
-def load_fisher_info(load_path: str, device: torch.device, 
-                    logger: Optional[logging.Logger] = None) -> List[torch.Tensor]:
-    """Load Fisher Information from disk."""
+def load_fisher_info(load_path: str, device: torch.device,
+                     logger: Optional[logging.Logger] = None) -> Dict[str, torch.Tensor]:
     if logger is None:
         logger = logging.getLogger(__name__)
-    
-    fisher_list = torch.load(load_path, map_location=device)
+    payload = torch.load(load_path, map_location=device)
+    fisher_dict = {name: tensor.to(device=device) for name, tensor in payload.items()}
     logger.info(f"Loaded Fisher Information from {load_path}")
-    return fisher_list
+    return fisher_dict
