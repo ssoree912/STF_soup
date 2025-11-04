@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, Subset
 import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
+import numpy as np
 
 from args import init_sub_args
 from dataset import get_dataset_and_loader
@@ -261,28 +262,84 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_subset", type=int, default=0, 
                         help="Use at most this many samples for evaluation (0 = use all).")
 
-    # Mask/evaluation behavior
-    parser.add_argument("--apply_masks_during_eval", action="store_true",
-                        help="If set, apply individual pruning masks to each source model during coefficient search/evaluation. "
-                             "By default, masks are applied only to the final merged model.")
-
-    # Fisher weighting hyperparameters (must be supported by FisherSoupSTGNF)
-    parser.add_argument("--fisher_gamma", type=float, default=0.75,
-                        help="Exponent for Fisher reweighting (e.g., 0.5 ~ 1.0).")
-    parser.add_argument("--fisher_clip_quantile", type=float, default=0.995,
-                        help="Quantile for clipping Fisher magnitudes (e.g., 0.99, 0.995, 0.997).")
-
-    # Stabilization hyperparameter for invertible layers (if supported)
-    parser.add_argument("--stabilize_sigma_min", type=float, default=1e-3,
-                        help="Minimum singular value used when reprojecting invertible layers.")
-
     # Checkpoint patterns
     parser.add_argument("--checkpoint_pattern", default="checkpoint_best.pth.tar",
                         help="Checkpoint filename pattern to look for.")
     parser.add_argument("--mask_name", default="pruning_mask.pt",
                         help="Common mask filename to look for in each folder.")
+    parser.add_argument("--mask_logic", choices=["or", "and", "none"], default="or",
+                        help="How to combine pruning masks across checkpoints.")
+    parser.add_argument("--no_reproject_invertible", action="store_true",
+                        help="Disable post-merge re-projection of invertible 1x1 convolutions.")
+    parser.add_argument("--no_actnorm_reinit", action="store_true",
+                        help="Disable ActNorm reinitialization after merging.")
+    parser.add_argument("--calibrate_actnorm_batches", type=int, default=0,
+                        help="If >0, run this many batches of data for ActNorm calibration after merging.")
+    parser.add_argument("--eval_individual", action="store_true",
+                        help="Evaluate each model individually before merging.")
+    parser.add_argument("--dump_debug_dir", default="",
+                        help="Directory to dump score distributions for diagnostics.")
+    parser.add_argument("--fisher_gamma", type=float, default=0.0,
+                        help="Exponent for Fisher weights (0 = uniform weighting).")
+    parser.add_argument("--fisher_clip_quantile", type=float, default=1.0,
+                        help="Quantile for clipping Fisher weights (1.0 = no clipping).")
 
     return parser.parse_args()
+
+
+def combine_masks_with_logic(masks: Sequence[Optional[dict]], logic: str) -> Optional[dict]:
+    """Combine pruning masks according to the chosen logic."""
+    if logic == "none":
+        return None
+
+    combined = None
+    for mask in masks:
+        if mask is None:
+            continue
+        bool_mask = {key: (tensor != 0).to(torch.bool) for key, tensor in mask.items()}
+        if combined is None:
+            combined = {key: value.clone() for key, value in bool_mask.items()}
+        else:
+            for key, value in bool_mask.items():
+                if key in combined:
+                    if logic == "or":
+                        combined[key] = torch.logical_or(combined[key], value)
+                    elif logic == "and":
+                        combined[key] = torch.logical_and(combined[key], value)
+                else:
+                    combined[key] = value.clone()
+    return combined
+
+
+def count_sparsity(model: torch.nn.Module) -> tuple:
+    """Return non-zero count, total parameters, and sparsity ratio."""
+    nonzero = 0
+    total = 0
+    with torch.no_grad():
+        for param in model.parameters():
+            if param is None:
+                continue
+            total += param.numel()
+            nonzero += (param != 0).sum().item()
+    sparsity = 1.0 - (nonzero / max(1, total))
+    return nonzero, total, sparsity
+
+
+def dump_score_hist(scores, labels, out_dir: str, tag: str) -> None:
+    """Persist score distributions for offline debugging."""
+    if not out_dir:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    scores = np.asarray(scores).ravel()
+    labels = np.asarray(labels).ravel()
+    np.save(os.path.join(out_dir, f"scores_{tag}.npy"), scores)
+    np.save(os.path.join(out_dir, f"labels_{tag}.npy"), labels)
+    summary_path = os.path.join(out_dir, f"summary_{tag}.txt")
+    with open(summary_path, "w") as handle:
+        handle.write(f"n={scores.size} mean={scores.mean():.6f} std={scores.std():.6f}\n")
+        for percentile in (5, 25, 50, 75, 95):
+            value = np.percentile(scores, percentile)
+            handle.write(f"p{percentile}: {value:.6f}\n")
 
 
 def main():
@@ -367,21 +424,18 @@ def main():
     )
 
     fisher_soup = FisherSoupSTGNF(device, logger, model_args=model_args)
-    combined_mask = fisher_soup.combine_masks(masks)
+    fisher_soup.fisher_gamma = args.fisher_gamma
+    fisher_soup.fisher_clip_quantile = args.fisher_clip_quantile
+    fisher_soup.disable_reproject = args.no_reproject_invertible
+    fisher_soup.disable_actnorm_reinit = args.no_actnorm_reinit
+    fisher_soup.calibrate_actnorm_batches = args.calibrate_actnorm_batches
 
-    # Propagate CLI hyperparameters into FisherSoupSTGNF (if supported)
-    if hasattr(fisher_soup, "__dict__"):
-        setattr(fisher_soup, "fisher_gamma", getattr(args, "fisher_gamma", 0.75))
-        setattr(fisher_soup, "fisher_clip_quantile", getattr(args, "fisher_clip_quantile", 0.995))
-        setattr(fisher_soup, "stabilize_sigma_min", getattr(args, "stabilize_sigma_min", 1e-3))
-
-    # By default, do NOT apply individual masks during evaluation; only apply to final merged model.
-    if args.apply_masks_during_eval:
-        for model, mask in zip(models, masks):
-            fisher_soup.apply_mask_to_model(model, mask)
-        logger.info("Applied individual masks to models during evaluation.")
+    combined_mask = combine_masks_with_logic(masks, args.mask_logic)
+    if args.mask_logic == "none":
+        logger.info("Mask logic disabled; proceeding without applying pruning masks.")
     else:
-        logger.info("Evaluation without applying individual masks; combined mask will be applied to the final soup only.")
+        logger.info("Mask logic '%s' produced %s combined mask.",
+                    args.mask_logic, "a" if combined_mask is not None else "no")
 
     # Generate coefficient combinations
     coefficients_set = generate_coefficients(
@@ -413,6 +467,18 @@ def main():
             seed=args.random_seed,
             logger=logger
         )
+        
+        if args.eval_individual:
+            logger.info("Evaluating individual checkpoints prior to merging...")
+            for model_idx, model in enumerate(models, start=1):
+                eval_result = fisher_soup.evaluate_model(model, test_loader, dataset_test, ref_args)
+                logger.info("  Model #%d AUC=%.4f", model_idx, eval_result["auc"])
+                nonzero, total, sparsity = count_sparsity(model)
+                logger.info("  Model #%d nonzero=%d total=%d (sparsity=%.2f%%)",
+                            model_idx, nonzero, total, sparsity * 100.0)
+                if args.dump_debug_dir:
+                    dump_score_hist(eval_result["scores"], eval_result["labels"],
+                                    args.dump_debug_dir, f"model{model_idx}")
 
     # Search for optimal coefficients or use default
     if test_loader is not None:
@@ -426,7 +492,7 @@ def main():
             fisher_floor=args.fisher_floor,
             favor_target_model=not args.no_favor_target,
             normalize_fishers=not args.no_normalize_fishers,
-            combined_mask=combined_mask if args.apply_masks_during_eval else None,
+            combined_mask=combined_mask,
             print_results=True
         )
         best_result = max(results, key=lambda x: x.score["roc_auc"])
@@ -448,8 +514,10 @@ def main():
         combined_mask=combined_mask
     )
     _, final_model = next(merged_models)
-    logger.info("Applying combined mask to the final merged model.")
-    fisher_soup.apply_mask_to_model(final_model, combined_mask)
+
+    if args.calibrate_actnorm_batches > 0 and test_loader is not None:
+        logger.info("Calibrating ActNorm using %d batches before evaluation.", args.calibrate_actnorm_batches)
+        fisher_soup.calibrate_actnorm(final_model, test_loader, args.calibrate_actnorm_batches, ref_args)
 
     # Save merged model
     final_state_dict = final_model.state_dict()
@@ -503,6 +571,10 @@ def main():
         final_eval = fisher_soup.evaluate_model(final_model, test_loader, dataset_test, ref_args)
         logger.info("Final merged model performance:")
         logger.info("  ROC AUC: %.4f", final_eval["roc_auc"])
+        if args.dump_debug_dir:
+            dump_score_hist(final_eval["scores"], final_eval["labels"], args.dump_debug_dir, "merged")
+        nonzero, total, sparsity = count_sparsity(final_model)
+        logger.info("Merged model nonzero=%d total=%d (sparsity=%.2f%%)", nonzero, total, sparsity * 100.0)
 
     logger.info("Folder Fisher Soup for STG-NF completed successfully!")
 

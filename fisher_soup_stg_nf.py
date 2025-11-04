@@ -82,28 +82,90 @@ class FisherSoupSTGNF:
         return projected.to(device=weight_detached.device, dtype=original_dtype)
 
     def _stabilize_after_merge(self, model: STG_NF, sigma_min: float = 1e-3) -> None:
-        """Stabilize merged model by reprojecting invertible layers and reinitializing ActNorm."""
-        with torch.no_grad():
-            for name, param in model.named_parameters():
-                name_lower = name.lower()
-                # Handle square 2D matrices (common for invertible 1x1 conv represented as [C, C])
-                if param.ndim == 2 and param.shape[0] == param.shape[1]:
+        """Stabilize merged model by optionally reprojecting invertible layers and/or reinitializing ActNorm."""
+        sigma_min = getattr(self, "stabilize_sigma_min", sigma_min)
+        if not getattr(self, "disable_reproject", False):
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    name_lower = name.lower()
                     if any(token in name_lower for token in ("invconv", "invertible", "1x1", "conv1x1")):
-                        param.copy_(self._project_invertible(param.data, sigma_min=sigma_min))
-                # Handle 1x1 conv stored as 4D [C, C, 1, 1]
-                elif param.ndim == 4 and param.shape[2:] == (1, 1) and param.shape[0] == param.shape[1]:
-                    if any(token in name_lower for token in ("invconv", "invertible", "1x1", "conv1x1")):
-                        flat = param.data.flatten(2).squeeze(-1)  # [C, C]
-                        proj = self._project_invertible(flat, sigma_min=sigma_min)
-                        param.copy_(proj.view_as(param))
+                        # Handle square 2D matrices (common for invertible 1x1 conv represented as [C, C])
+                        if param.ndim == 2 and param.shape[0] == param.shape[1]:
+                            param.copy_(self._project_invertible(param.data, sigma_min=sigma_min))
+                        # Handle 1x1 conv stored as 4D [C, C, 1, 1]
+                        elif param.ndim == 4 and param.shape[2:] == (1, 1) and param.shape[0] == param.shape[1]:
+                            flat = param.data.flatten(2).squeeze(-1)
+                            proj = self._project_invertible(flat, sigma_min=sigma_min)
+                            param.copy_(proj.view_as(param))
 
-        if hasattr(model, "set_actnorm_init"):
+        if not getattr(self, "disable_actnorm_reinit", False) and hasattr(model, "set_actnorm_init"):
             model.set_actnorm_init()
+    
+    def _mergeable_names(self, model: STG_NF) -> List[str]:
+        """Names of parameters considered during merging."""
+        names: List[str] = []
+        for name, tensor in model.state_dict().items():
+            param_tensor = tensor if torch.is_tensor(tensor) else torch.as_tensor(tensor)
+            if self._should_skip_parameter(name, param_tensor):
+                continue
+            names.append(name)
+        return names
+
+    def _resolve_fisher_tensor(self,
+                               fisher_source,
+                               name: str,
+                               name_to_index: Dict[str, int]) -> Optional[torch.Tensor]:
+        """Retrieve Fisher tensor for a parameter from dict or list storage."""
+        if fisher_source is None:
+            return None
+
+        if isinstance(fisher_source, dict):
+            return fisher_source.get(name)
+
+        if isinstance(fisher_source, (list, tuple)):
+            idx = name_to_index.get(name)
+            if idx is None or idx >= len(fisher_source):
+                return None
+            return fisher_source[idx]
+
+        # Unknown format
+        return None
+
+    def calibrate_actnorm(self,
+                          model: STG_NF,
+                          data_loader,
+                          max_batches: int,
+                          args) -> None:
+        """Run a few batches through the model to calibrate ActNorm statistics."""
+        if max_batches <= 0:
+            return
+        if not hasattr(model, "set_actnorm_init"):
+            return
+
+        model.eval()
+        processed = 0
+        with torch.no_grad():
+            for data_arr in data_loader:
+                data = [d.to(self.device, non_blocking=True) for d in data_arr]
+                score = data[-2].amin(dim=-1)
+
+                if getattr(args, 'model_confidence', False):
+                    samp = data[0]
+                else:
+                    samp = data[0][:, :2]
+
+                batch = samp.shape[0]
+                labels = torch.ones(batch, device=self.device)
+                model(samp.float(), label=labels, score=score)
+
+                processed += 1
+                if processed >= max_batches:
+                    break
     
     def _merge_with_coeffs(self, 
                           models: List[STG_NF],
                           coefficients: Sequence[float],
-                          fishers: Optional[List[Dict[str, torch.Tensor]]] = None,
+                          fishers: Optional[List] = None,
                           fisher_floor: float = 1e-6,
                           favor_target_model: bool = True,
                           normalize_fishers: bool = True,
@@ -119,8 +181,12 @@ class FisherSoupSTGNF:
         # Get state dicts from all models
         model_states = [model.state_dict() for model in models]
         
-        gamma = getattr(self, "fisher_gamma", 0.75)
-        clip_quantile = getattr(self, "fisher_clip_quantile", 0.995)
+        mergeable_names = self._mergeable_names(models[0])
+        name_to_index = {name: idx for idx, name in enumerate(mergeable_names)}
+        missing_fisher = set()
+
+        gamma = getattr(self, "fisher_gamma", 0.0)
+        clip_quantile = getattr(self, "fisher_clip_quantile", 1.0)
         fisher_floor = max(fisher_floor, 1e-8)
         
         # Merge each parameter
@@ -137,10 +203,17 @@ class FisherSoupSTGNF:
             
             for model_idx, (tensor, coeff) in enumerate(zip(tensors, coefficients)):
                 fisher_tensor = None
-                if fishers is not None and model_idx < len(fishers) and fishers[model_idx]:
-                    fisher_tensor = fishers[model_idx].get(name)
+                fisher_entry = None
+                if fishers is not None and model_idx < len(fishers):
+                    fisher_entry = fishers[model_idx]
+                    fisher_tensor = self._resolve_fisher_tensor(fisher_entry, name, name_to_index)
 
                 if fisher_tensor is None:
+                    if fisher_entry is not None and (model_idx, name) not in missing_fisher:
+                        if self.logger:
+                            self.logger.warning("Missing Fisher entry for parameter '%s' in model %d; using uniform weight.",
+                                                name, model_idx)
+                        missing_fisher.add((model_idx, name))
                     fisher_tensor = torch.ones_like(tensor, device=tensor.device, dtype=tensor.dtype)
                 else:
                     fisher_tensor = fisher_tensor.to(tensor.device, dtype=tensor.dtype)
@@ -156,8 +229,13 @@ class FisherSoupSTGNF:
                             fisher_tensor = torch.ones_like(tensor, device=tensor.device, dtype=tensor.dtype)
 
                     f_abs = fisher_tensor.abs()
-                    scale = f_abs.mean().clamp_min(1e-8)
-                    fisher_tensor = (f_abs / scale).pow(gamma)
+                    if normalize_fishers:
+                        scale = f_abs.mean().clamp_min(1e-8)
+                        f_abs = f_abs / scale
+                    if gamma == 0.0:
+                        fisher_tensor = torch.ones_like(f_abs, device=tensor.device, dtype=tensor.dtype)
+                    else:
+                        fisher_tensor = f_abs.pow(gamma)
                     if clip_quantile is not None and 0.0 < clip_quantile < 1.0 and fisher_tensor.numel() > 1:
                         q = torch.quantile(fisher_tensor.detach().flatten(), float(clip_quantile))
                         fisher_tensor = torch.clamp(fisher_tensor, max=q)
@@ -307,7 +385,7 @@ class FisherSoupSTGNF:
                                   test_loader,
                                   dataset_test,
                                   args,
-                                  fishers: Optional[List[Dict[str, torch.Tensor]]] = None,
+                                  fishers: Optional[List] = None,
                                   fisher_floor: float = 1e-6,
                                   favor_target_model: bool = True,
                                   normalize_fishers: bool = True,
