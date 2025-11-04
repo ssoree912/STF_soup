@@ -1,6 +1,7 @@
 import copy
 import logging
 import os
+import re
 from collections import namedtuple
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -23,7 +24,50 @@ class FisherSoupSTGNF:
         self.device = device
         self.logger = logger or logging.getLogger(__name__)
         self.model_args = copy.deepcopy(model_args) if model_args is not None else None
+        # 새 노브 (구버전 성향을 기본값으로 유지)
+        self.fisher_gamma: float = 0.75
+        self.fisher_clip_quantile: float = 0.995
+        self.normalize_fishers: bool = True
+        self.trust_lambda: float = 1.0
+        self.target_index: int = 0
+        self.layer_regex: Optional[re.Pattern] = None
     
+    def calibrate_actnorm(self, model: STG_NF, data_loader, max_batches: int, args) -> None:
+        """Lightweight ActNorm calibration without full retraining."""
+        if max_batches <= 0 or not hasattr(model, "set_actnorm_init"):
+            return
+        model.set_actnorm_init()
+        model.eval()
+        processed = 0
+        with torch.no_grad():
+            for data_arr in data_loader:
+                data = [d.to(self.device, non_blocking=True) for d in data_arr]
+                score = data[-2].amin(dim=-1)
+                samp = data[0] if getattr(args, "model_confidence", False) else data[0][:, :2]
+                model(samp.float(), label=torch.ones(samp.shape[0], device=self.device), score=score)
+                processed += 1
+                if processed >= max_batches:
+                    break
+
+    def _name_allowed(self, name: str, tensor: torch.Tensor) -> bool:
+        """Check whether a parameter is eligible for merging under layer filtering."""
+        if self.layer_regex is not None and self.layer_regex.search(name) is None:
+            return False
+        return True
+
+    def _resolve_fisher_tensor(self, fisher_source, name: str, idx_map: Dict[str, int]) -> Optional[torch.Tensor]:
+        """Resolve Fisher tensor whether stored as dict or list-like."""
+        if fisher_source is None:
+            return None
+        if isinstance(fisher_source, dict):
+            return fisher_source.get(name)
+        if isinstance(fisher_source, (list, tuple)):
+            idx = idx_map.get(name)
+            if idx is None or idx >= len(fisher_source):
+                return None
+            return fisher_source[idx]
+        return None
+
     def print_merge_result(self, result: MergeResult):
         """Print merge result in a readable format."""
         self.logger.info(f"Merging coefficients: {result.coefficients}")
@@ -66,45 +110,49 @@ class FisherSoupSTGNF:
             return True
         return False
     
-    def _merge_with_coeffs(self, 
-                          models: List[STG_NF],
-                          coefficients: Sequence[float],
-                          fishers: Optional[List[List[torch.Tensor]]] = None,
-                          fisher_floor: float = 1e-6,
-                          favor_target_model: bool = True,
-                          normalize_fishers: bool = True,
-                          combined_mask: Optional[Dict[str, torch.Tensor]] = None) -> STG_NF:
-        """Merge models using Fisher-weighted averaging."""
+    def _merge_with_coeffs(self,
+                           models: List[STG_NF],
+                           coefficients: Sequence[float],
+                           fishers: Optional[List] = None,
+                           fisher_floor: float = 1e-6,
+                           favor_target_model: bool = True,
+                           normalize_fishers: bool = True,
+                           combined_mask: Optional[Dict[str, torch.Tensor]] = None) -> STG_NF:
+        """Merge models using Fisher-weighted averaging with trust-region control."""
+        del favor_target_model  # kept for backwards compatibility
         n_models = len(models)
         assert len(coefficients) == n_models
-        
-        # Create output model as a copy of the first model
-        output_model = self.clone_model(models[0])
-        output_state = output_model.state_dict()
-        
-        # Get state dicts from all models
-        model_states = [model.state_dict() for model in models]
-        
-        gamma = getattr(self, "fisher_gamma", 0.75)
-        clip_quantile = getattr(self, "fisher_clip_quantile", 0.995)
+
+        target = max(0, min(self.target_index, n_models - 1))
+        anchor_state = models[target].state_dict()
+
+        out_model = self.clone_model(models[target])
+        out_state = out_model.state_dict()
+        states = [model.state_dict() for model in models]
+
+        mergeable_names = [k for k, v in out_state.items() if not self._should_skip_parameter(k, v)]
+        name_to_idx = {n: i for i, n in enumerate(mergeable_names)}
+
+        gamma = float(self.fisher_gamma)
+        clip_q = float(self.fisher_clip_quantile)
         fisher_floor = max(fisher_floor, 1e-8)
-        
-        # Merge each parameter
-        for name, output_tensor in output_state.items():
-            if self._should_skip_parameter(name, output_tensor):
+        trust = float(self.trust_lambda)
+
+        for name, out_tensor in out_state.items():
+            if self._should_skip_parameter(name, out_tensor):
                 continue
-                
-            # Collect tensors from all models
-            tensors = [state[name] for state in model_states]
-            
-            # Initialize accumulators
+            if not self._name_allowed(name, out_tensor):
+                out_state[name] = anchor_state[name]
+                continue
+
+            tensors = [state[name] for state in states]
             numerator = None
             denominator = None
-            
+
             for model_idx, (tensor, coeff) in enumerate(zip(tensors, coefficients)):
                 fisher_tensor = None
-                if fishers is not None and model_idx < len(fishers) and fishers[model_idx]:
-                    fisher_tensor = fishers[model_idx].get(name)
+                if fishers is not None and model_idx < len(fishers):
+                    fisher_tensor = self._resolve_fisher_tensor(fishers[model_idx], name, name_to_idx)
 
                 if fisher_tensor is None:
                     fisher_tensor = torch.ones_like(tensor, device=tensor.device, dtype=tensor.dtype)
@@ -114,51 +162,46 @@ class FisherSoupSTGNF:
                         if fisher_tensor.numel() == tensor.numel():
                             fisher_tensor = fisher_tensor.view_as(tensor)
                         else:
-                            if self.logger:
-                                self.logger.warning(
-                                    "Fisher shape %s mismatched with parameter %s shape %s; falling back to uniform weighting",
-                                    tuple(fisher_tensor.shape), name, tuple(tensor.shape)
-                                )
+                            self.logger.warning(
+                                "Fisher shape mismatch on %s (model %d); fallback uniform weighting.",
+                                name, model_idx
+                            )
                             fisher_tensor = torch.ones_like(tensor, device=tensor.device, dtype=tensor.dtype)
 
                     f_abs = fisher_tensor.abs()
-                    scale = f_abs.mean().clamp_min(1e-8)
-                    fisher_tensor = (f_abs / scale).pow(gamma)
-                    if clip_quantile is not None and 0.0 < clip_quantile < 1.0 and fisher_tensor.numel() > 1:
-                        q = torch.quantile(fisher_tensor.detach().flatten(), float(clip_quantile))
+                    if normalize_fishers and self.normalize_fishers:
+                        scale = f_abs.mean().clamp_min(1e-8)
+                        f_abs = f_abs / scale
+
+                    fisher_tensor = torch.ones_like(f_abs) if gamma == 0.0 else f_abs.pow(gamma)
+
+                    if 0.0 < clip_q < 1.0 and fisher_tensor.numel() > 1:
+                        q = torch.quantile(fisher_tensor.flatten().detach(), clip_q)
                         fisher_tensor = torch.clamp(fisher_tensor, max=q)
-                    fisher_tensor = torch.clamp(fisher_tensor, min=fisher_floor)
 
-                if not favor_target_model or model_idx != 0:
                     fisher_tensor = torch.clamp(fisher_tensor, min=fisher_floor)
-
-                if fisher_tensor.ndim == 0:
-                    fisher_tensor = fisher_tensor.expand_as(tensor)
 
                 weight = coeff * fisher_tensor
                 if not isinstance(weight, torch.Tensor):
                     weight = torch.tensor(weight, dtype=tensor.dtype, device=tensor.device)
                 if weight.ndim == 0:
                     weight = weight.expand_as(tensor)
-                contrib = tensor * weight
 
-                if numerator is None:
-                    numerator = contrib
-                    denominator = weight
-                else:
-                    numerator = numerator + contrib
-                    denominator = denominator + weight
-            
-            # Update output parameter
-            output_state[name] = numerator / denominator.clamp_min(1e-12)
-        
-        # Apply combined mask if provided
+                contribution = tensor * weight
+                numerator = contribution if numerator is None else numerator + contribution
+                denominator = weight if denominator is None else denominator + weight
+
+            merged = numerator / denominator.clamp_min(1e-12)
+            if trust < 1.0:
+                merged = (1.0 - trust) * anchor_state[name] + trust * merged
+
+            out_state[name] = merged
+
         if combined_mask is not None:
-            self.apply_mask_to_state_dict(output_state, combined_mask)
-        
-        # Load the merged state dict
-        output_model.load_state_dict(output_state)
-        return output_model
+            self.apply_mask_to_state_dict(out_state, combined_mask)
+
+        out_model.load_state_dict(out_state, strict=False)
+        return out_model
     
     def clone_model(self, model: STG_NF) -> STG_NF:
         """Create a deep copy of the model."""
@@ -214,7 +257,7 @@ class FisherSoupSTGNF:
     def generate_merged_for_coeffs_set(self,
                                      models: List[STG_NF],
                                      coefficients_set: Sequence[Sequence[float]],
-                                     fishers: Optional[List[List[torch.Tensor]]] = None,
+                                     fishers: Optional[List] = None,
                                      fisher_floor: float = 1e-6,
                                      favor_target_model: bool = True,
                                      normalize_fishers: bool = True,
@@ -272,7 +315,7 @@ class FisherSoupSTGNF:
                                   test_loader,
                                   dataset_test,
                                   args,
-                                  fishers: Optional[List[List[torch.Tensor]]] = None,
+                                  fishers: Optional[List] = None,
                                   fisher_floor: float = 1e-6,
                                   favor_target_model: bool = True,
                                   normalize_fishers: bool = True,
@@ -342,7 +385,7 @@ def load_models_and_fishers(checkpoint_paths: List[str],
                             model_args: Dict,
                             device: torch.device,
                             logger: Optional[logging.Logger] = None,
-                            mask_name: str = "pruning_mask.pt") -> Tuple[List[STG_NF], Optional[List[List[torch.Tensor]]], List[Optional[Dict[str, torch.Tensor]]]]:
+                            mask_name: str = "pruning_mask.pt") -> Tuple[List[STG_NF], Optional[List], List[Optional[Dict[str, torch.Tensor]]]]:
     """Load STG-NF models and their Fisher information."""
     if logger is None:
         logger = logging.getLogger(__name__)

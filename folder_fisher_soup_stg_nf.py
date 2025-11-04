@@ -11,6 +11,7 @@ import sys
 import random
 import gc
 import json
+import re
 from pathlib import Path
 from typing import List, Optional, Sequence
 from torch.utils.data import DataLoader, Subset
@@ -235,6 +236,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_favor_target", action="store_true")
     parser.add_argument("--no_normalize_fishers", action="store_true")
     parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--fisher_gamma", type=float, default=0.75)
+    parser.add_argument("--fisher_clip_quantile", type=float, default=0.995)
+    parser.add_argument("--trust_lambda", type=float, default=1.0,
+                        help="0~1; 1이면 완전 병합")
+    parser.add_argument("--target_index", type=int, default=-1,
+                        help="-1이면 개별 평가로 자동 선택")
+    parser.add_argument("--layer_regex", type=str, default="",
+                        help="병합 대상 레이어 정규식 (없으면 전체)")
+    parser.add_argument("--eval_individual", action="store_true",
+                        help="병합 전 개별 모델 AUC 측정")
+    parser.add_argument("--calibrate_actnorm_batches", type=int, default=0,
+                        help="병합 후 ActNorm 캘리브 배치 수 (0=off)")
+    parser.add_argument("--greedy_refine", action="store_true",
+                        help="Dirichlet 표본에서 최고 조합을 기준으로 2-모델 미세 그리드 재탐색")
 
     # Fisher computation memory-safe options
     parser.add_argument("--fisher_batch_size", type=int, default=1, 
@@ -352,6 +367,11 @@ def main():
     )
 
     fisher_soup = FisherSoupSTGNF(device, logger, model_args=model_args)
+    fisher_soup.fisher_gamma = args.fisher_gamma
+    fisher_soup.fisher_clip_quantile = args.fisher_clip_quantile
+    fisher_soup.trust_lambda = args.trust_lambda
+    fisher_soup.normalize_fishers = not args.no_normalize_fishers
+    fisher_soup.layer_regex = re.compile(args.layer_regex) if args.layer_regex else None
     combined_mask = fisher_soup.combine_masks(masks)
     for model, mask in zip(models, masks):
         fisher_soup.apply_mask_to_model(model, mask)
@@ -367,11 +387,12 @@ def main():
     logger.info("Generated %d coefficient combinations using %s strategy",
                 len(coefficients_set), args.strategy)
 
-    # Prepare evaluation if requested
+    # Prepare evaluation/calibration loader when needed
     test_loader = None
     dataset_test = None
-    if args.evaluate:
-        logger.info("Preparing dataset for evaluation...")
+    needs_test_loader = args.evaluate or args.eval_individual or args.calibrate_actnorm_batches > 0
+    if needs_test_loader:
+        logger.info("Preparing dataset for evaluation/calibration...")
         test_loader = loader['test']
         dataset_test = dataset['test']
         
@@ -387,8 +408,53 @@ def main():
             logger=logger
         )
 
+    best_anchor = 0
+    best_anchor_auc: Optional[float] = None
+    if args.evaluate and args.eval_individual and test_loader is not None:
+        logger.info("Evaluating individual checkpoints prior to merging...")
+        best_auc = -1.0
+        for idx, model in enumerate(models):
+            result = fisher_soup.evaluate_model(model, test_loader, dataset_test, ref_args)
+            logger.info("  Model #%d AUC=%.4f", idx, result["auc"])
+            if result["auc"] > best_auc:
+                best_auc = result["auc"]
+                best_anchor = idx
+        best_anchor_auc = best_auc if best_auc >= 0 else None
+        if best_anchor_auc is not None:
+            logger.info("Best individual model = #%d (AUC=%.4f)", best_anchor, best_anchor_auc)
+
+    anchor_mode = "manual" if args.target_index >= 0 else (
+        "auto" if (args.evaluate and args.eval_individual and best_anchor_auc is not None) else "default"
+    )
+    if args.target_index >= 0:
+        if args.target_index >= len(models):
+            logger.warning("Requested target_index %d exceeds model count %d; clamping.", args.target_index, len(models))
+        fisher_soup.target_index = max(0, min(args.target_index, len(models) - 1))
+    else:
+        fisher_soup.target_index = best_anchor
+
+    if args.evaluate and args.greedy_refine and len(models) == 2 and test_loader is not None:
+        logger.info("Greedy refine enabled: pairwise grid around best Dirichlet sample.")
+        base_results = fisher_soup.search_merging_coefficients(
+            models=models,
+            coefficients_set=coefficients_set,
+            test_loader=test_loader,
+            dataset_test=dataset_test,
+            args=ref_args,
+            fishers=fishers,
+            fisher_floor=args.fisher_floor,
+            favor_target_model=not args.no_favor_target,
+            normalize_fishers=not args.no_normalize_fishers,
+            combined_mask=combined_mask,
+            print_results=False
+        )
+        if base_results:
+            best_dirichlet = max(base_results, key=lambda x: x.score["roc_auc"])
+            logger.info("  Best Dirichlet sample ROC AUC: %.4f", best_dirichlet.score["roc_auc"])
+        coefficients_set = fisher_soup.create_pairwise_grid_coeffs(33)
+
     # Search for optimal coefficients or use default
-    if test_loader is not None:
+    if args.evaluate and test_loader is not None:
         results = fisher_soup.search_merging_coefficients(
             models=models,
             coefficients_set=coefficients_set,
@@ -423,6 +489,13 @@ def main():
     _, final_model = next(merged_models)
     fisher_soup.apply_mask_to_model(final_model, combined_mask)
 
+    if args.calibrate_actnorm_batches > 0:
+        if test_loader is None:
+            logger.warning("ActNorm calibration requested but no loader available; skipping.")
+        else:
+            logger.info("Calibrating ActNorm with %d batches...", args.calibrate_actnorm_batches)
+            fisher_soup.calibrate_actnorm(final_model, test_loader, args.calibrate_actnorm_batches, ref_args)
+
     # Save merged model
     final_state_dict = final_model.state_dict()
     
@@ -441,6 +514,15 @@ def main():
         "random_seed": args.random_seed,
         "device": str(device),
         "mask_applied": combined_mask is not None,
+        "fisher_gamma": args.fisher_gamma,
+        "fisher_clip_quantile": args.fisher_clip_quantile,
+        "trust_lambda": args.trust_lambda,
+        "target_index": int(fisher_soup.target_index),
+        "layer_regex": args.layer_regex,
+        "eval_individual": args.eval_individual,
+        "greedy_refine": args.greedy_refine,
+        "calibrate_actnorm_batches": args.calibrate_actnorm_batches,
+        "anchor_mode": anchor_mode,
     }
     
     if best_result is not None:
@@ -448,6 +530,9 @@ def main():
             "auc": float(best_result.score["auc"]),
             "roc_auc": float(best_result.score["roc_auc"])
         }
+        if best_anchor_auc is not None:
+            soup_metadata["evaluation"]["best_individual_index"] = int(best_anchor)
+            soup_metadata["evaluation"]["best_individual_auc"] = float(best_anchor_auc)
 
     payload = {
         "state_dict": final_state_dict,
