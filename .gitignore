@@ -205,3 +205,5 @@ data/exp_dir/*
 experiments/*
 soups/*
 sample/
+results
+fisher_cache/
