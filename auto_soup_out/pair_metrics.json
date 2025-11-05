@@ -1,0 +1,23 @@
+{
+  "experiments/ShanghaiTech/prune_mag0p025_rnd0p025_ep1/seed_100/rand_100/pruning_soup_run1/checkpoint_best.pth.tar||experiments/ShanghaiTech/prune_mag0p025_rnd0p025_ep1/seed_100/rand_101/pruning_soup_run2/checkpoint_best.pth.tar": {
+    "CKA": 0.9837893843650818,
+    "FID_like": 21.910400390625,
+    "JS_div": 5.9696711105061695e-05,
+    "Score_Spearman": 0.9815974235534668,
+    "Grad_Cosine": 0.8815323859453201
+  },
+  "experiments/ShanghaiTech/prune_mag0p025_rnd0p025_ep1/seed_100/rand_100/pruning_soup_run1/checkpoint_best.pth.tar||experiments/ShanghaiTech/prune_mag0p025_rnd0p025_ep1/seed_100/rand_102/pruning_soup_run3/checkpoint_best.pth.tar": {
+    "CKA": 0.9634802341461182,
+    "FID_like": 48.81689453125,
+    "JS_div": 0.0002400214725639671,
+    "Score_Spearman": 0.9676294326782227,
+    "Grad_Cosine": 0.8000462576746941
+  },
+  "experiments/ShanghaiTech/prune_mag0p025_rnd0p025_ep1/seed_100/rand_101/pruning_soup_run2/checkpoint_best.pth.tar||experiments/ShanghaiTech/prune_mag0p025_rnd0p025_ep1/seed_100/rand_102/pruning_soup_run3/checkpoint_best.pth.tar": {
+    "CKA": 0.9840437769889832,
+    "FID_like": 29.779296875,
+    "JS_div": 0.00017543371359352022,
+    "Score_Spearman": 0.9701826572418213,
+    "Grad_Cosine": 0.7412877213209867
+  }
+}

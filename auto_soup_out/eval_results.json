@@ -1,0 +1,7 @@
+{
+  "auto_soup_out/cluster0_fisher.pth.tar": {
+    "roc_auc": 0.8381285376706729,
+    "auc": 0.8381285376706729,
+    "num_samples": 40791
+  }
+}
