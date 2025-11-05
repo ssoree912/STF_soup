@@ -10,7 +10,7 @@ from models.STG_NF.model_pose import STG_NF
 
 
 class FisherSTGNF:
-    """Fisher Information computation for STG-NF models."""
+    """Fisher Information computation for STG-NF models with uncertainty weighting support."""
     
     def __init__(self, model: STG_NF, device: torch.device, logger: Optional[logging.Logger] = None, args=None):
         self.model = model
@@ -134,6 +134,43 @@ class FisherSTGNF:
                 sample_fishers[name] = torch.zeros_like(param, device=self.device)
 
         return sample_fishers
+    
+    def _compute_uncertainty_weighted_fisher_for_batch(self, batch_data: Tuple,
+                                                      name_param: List[Tuple[str, torch.nn.Parameter]],
+                                                      uncertainty_weights: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute uncertainty-weighted Fisher Information for a single batch."""
+        data, labels, scores = batch_data[:3]
+
+        # Move to device
+        data = data.to(self.device, non_blocking=True)
+        labels = labels.to(self.device, non_blocking=True)
+        scores = scores.to(self.device, non_blocking=True)
+        uncertainty_weights = uncertainty_weights.to(self.device, non_blocking=True)
+        batch_size = data.shape[0]
+
+        fisher_dict = {name: torch.zeros_like(param, device=self.device)
+                       for name, param in name_param}
+
+        # Process each sample in the batch
+        for b in range(batch_size):
+            sample_data = data[b:b+1]
+            sample_label = labels[b:b+1]
+            sample_score = scores[b:b+1]
+            sample_weight = uncertainty_weights[b]
+
+            sample_fishers = self._compute_fisher_single_sample(
+                sample_data, sample_label, sample_score, name_param, self.args
+            )
+
+            # Weight Fisher information by uncertainty weight
+            for name in fisher_dict:
+                fisher_dict[name] += sample_fishers[name] * sample_weight
+
+        # Average over batch size
+        for name in fisher_dict:
+            fisher_dict[name] /= batch_size
+
+        return fisher_dict
 
     def compute_fisher_for_model(self, dataloader, max_batches: int = 100) -> Dict[str, torch.Tensor]:
         """Compute Fisher Information Matrix for the entire model."""
@@ -180,6 +217,66 @@ class FisherSTGNF:
                 fishers[name] /= n_batches
 
         self.logger.info(f"Fisher computation completed. Processed {n_batches} batches.")
+        return fishers
+
+    def compute_uncertainty_weighted_fisher(self, dataloader, uncertainty_weights: torch.Tensor, 
+                                          max_batches: int = 100) -> Dict[str, torch.Tensor]:
+        """Compute Fisher Information Matrix weighted by epistemic uncertainty."""
+        self.logger.info("Computing Uncertainty-Weighted Fisher Information Matrix for STG-NF model...")
+
+        name_param = self._mergeable_name_param()
+        self.logger.info(f"Found {len(name_param)} mergeable parameters")
+
+        fishers = {name: torch.zeros_like(param, device=self.device)
+                   for name, param in name_param}
+
+        self.model.eval()
+        n_batches = 0
+        sample_idx = 0
+
+        # Process data in batches
+        for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Computing UW-Fisher", leave=False)):
+            if batch_idx >= max_batches:
+                self.logger.info(f"Reached maximum batches limit ({max_batches})")
+                break
+                
+            try:
+                # Get batch size
+                batch_size = batch_data[0].shape[0]
+                
+                # Get uncertainty weights for this batch
+                batch_weights = uncertainty_weights[sample_idx:sample_idx + batch_size]
+                if batch_weights.shape[0] < batch_size:
+                    self.logger.warning(f"Not enough uncertainty weights for batch {batch_idx}")
+                    break
+                
+                batch_fishers = self._compute_uncertainty_weighted_fisher_for_batch(
+                    batch_data, name_param, batch_weights)
+
+                for name in fishers:
+                    fishers[name] += batch_fishers[name].detach()
+
+                n_batches += 1
+                sample_idx += batch_size
+
+                # Clear cache periodically
+                if batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
+                    
+            except torch.cuda.OutOfMemoryError:
+                self.logger.warning(f"CUDA OOM at batch {batch_idx}, clearing cache and continuing...")
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                self.logger.warning(f"Error processing batch {batch_idx}: {e}")
+                continue
+        
+        # Average over all batches
+        if n_batches > 0:
+            for name in fishers:
+                fishers[name] /= n_batches
+
+        self.logger.info(f"Uncertainty-weighted Fisher computation completed. Processed {n_batches} batches.")
         return fishers
 
 

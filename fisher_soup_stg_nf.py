@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, SequentialSampler
 from tqdm import tqdm
 
 from models.STG_NF.model_pose import STG_NF
@@ -316,6 +317,118 @@ class FisherSoupSTGNF:
         self.logger.info(f"Best result - Coefficients: {best_result.coefficients}, ROC AUC: {best_result.score['roc_auc']:.4f}")
         
         return results
+    
+    def uncertainty_weighted_fisher_soup(self,
+                                         models: List[STG_NF],
+                                         dataloader,
+                                         test_loader,
+                                         dataset_test,
+                                         args,
+                                         coefficients_set: Optional[Sequence[Sequence[float]]] = None,
+                                         n_weightings: int = 10,
+                                         fisher_floor: float = 1e-6,
+                                         favor_target_model: bool = True,
+                                         normalize_fishers: bool = True,
+                                         combined_mask: Optional[Dict[str, torch.Tensor]] = None,
+                                         print_results: bool = True,
+                                         max_batches: int = 100) -> Tuple[List[MergeResult], MergeResult, STG_NF]:
+        """Perform uncertainty-weighted Fisher Soup merging and return evaluation results and best model."""
+        self.logger.info("Starting Uncertainty-Weighted Fisher Soup (UWF-Soup) process...")
+
+        def _build_sequential_loader(loader) -> DataLoader:
+            sampler = SequentialSampler(loader.dataset)
+            loader_kwargs = dict(
+                batch_size=loader.batch_size,
+                sampler=sampler,
+                num_workers=loader.num_workers,
+                pin_memory=getattr(loader, "pin_memory", False),
+                drop_last=getattr(loader, "drop_last", False),
+            )
+            collate_fn = getattr(loader, "collate_fn", None)
+            if collate_fn is not None:
+                loader_kwargs["collate_fn"] = collate_fn
+            if getattr(loader, "persistent_workers", False):
+                loader_kwargs["persistent_workers"] = True
+            prefetch_factor = getattr(loader, "prefetch_factor", None)
+            if prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = prefetch_factor
+            return DataLoader(loader.dataset, **loader_kwargs)
+        
+        # Ensure deterministic ordering between uncertainty estimation and Fisher passes
+        sequential_loader = _build_sequential_loader(dataloader)
+
+        # Step 1: Compute epistemic uncertainty
+        from epistemic_uncertainty import EpistemicUncertainty
+        
+        uncertainty_calculator = EpistemicUncertainty(models, self.device, self.logger)
+        model_logps = uncertainty_calculator.compute_log_likelihoods(sequential_loader, args, max_batches)
+        epistemic_var = uncertainty_calculator.compute_epistemic_uncertainty(model_logps)
+        uncertainty_weights = uncertainty_calculator.compute_uncertainty_weights(epistemic_var)
+        
+        self.logger.info(f"Computed uncertainty weights for {len(uncertainty_weights)} samples")
+        
+        # Step 2: Compute uncertainty-weighted Fisher information for each model
+        from fisher_stg_nf import FisherSTGNF
+        
+        uncertainty_weighted_fishers = []
+        for i, model in enumerate(models):
+            self.logger.info(f"Computing uncertainty-weighted Fisher for model {i+1}/{len(models)}")
+            fisher_calculator = FisherSTGNF(model, self.device, self.logger, args)
+            
+            uw_fisher = fisher_calculator.compute_uncertainty_weighted_fisher(
+                sequential_loader, uncertainty_weights, max_batches
+            )
+            uncertainty_weighted_fishers.append(uw_fisher)
+            
+            # Clear cache
+            torch.cuda.empty_cache()
+        
+        # Step 3: Generate coefficients if not provided
+        if coefficients_set is None:
+            if len(models) == 2:
+                coefficients_set = self.create_pairwise_grid_coeffs(n_weightings)
+            else:
+                coefficients_set = self.create_random_coeffs(len(models), n_weightings)
+        
+        # Step 4: Search for optimal merging coefficients using UW-Fisher
+        self.logger.info("Searching optimal coefficients with uncertainty-weighted Fisher information...")
+        
+        results = self.search_merging_coefficients(
+            models=models,
+            coefficients_set=coefficients_set,
+            test_loader=test_loader,
+            dataset_test=dataset_test,
+            args=args,
+            fishers=uncertainty_weighted_fishers,
+            fisher_floor=fisher_floor,
+            favor_target_model=favor_target_model,
+            normalize_fishers=normalize_fishers,
+            combined_mask=combined_mask,
+            print_results=print_results
+        )
+        
+        # Step 5: Analyze uncertainty distribution
+        uncertainty_calculator.analyze_uncertainty_distribution(
+            epistemic_var, uncertainty_weights,
+            save_path="uncertainty_analysis.png"
+        )
+
+        best_result = max(results, key=lambda x: x.score["roc_auc"])
+        best_coefficients = best_result.coefficients
+        merged_iter = self.generate_merged_for_coeffs_set(
+            models=models,
+            coefficients_set=[best_coefficients],
+            fishers=uncertainty_weighted_fishers,
+            fisher_floor=fisher_floor,
+            favor_target_model=favor_target_model,
+            normalize_fishers=normalize_fishers,
+            combined_mask=combined_mask,
+        )
+        _, best_model = next(merged_iter)
+        if combined_mask is not None:
+            self.apply_mask_to_model(best_model, combined_mask)
+
+        return results, best_result, best_model
 
 
 def _normalize_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
