@@ -331,8 +331,13 @@ class FisherSoupSTGNF:
                                          normalize_fishers: bool = True,
                                          combined_mask: Optional[Dict[str, torch.Tensor]] = None,
                                          print_results: bool = True,
-                                         max_batches: int = 100) -> Tuple[List[MergeResult], MergeResult, STG_NF]:
+                                         max_batches: int = 100,
+                                         subsample_ratio: float = 0.5) -> Tuple[List[MergeResult], MergeResult, STG_NF]:
         """Perform uncertainty-weighted Fisher Soup merging and return evaluation results and best model."""
+        subsample_ratio = float(subsample_ratio)
+        if subsample_ratio <= 0.0 or subsample_ratio > 1.0:
+            self.logger.warning("subsample_ratio %.3f out of range (0,1]; using 1.0", subsample_ratio)
+            subsample_ratio = 1.0
         self.logger.info("Starting Uncertainty-Weighted Fisher Soup (UWF-Soup) process...")
 
         def _build_sequential_loader(loader) -> DataLoader:
@@ -376,7 +381,11 @@ class FisherSoupSTGNF:
             fisher_calculator = FisherSTGNF(model, self.device, self.logger, args)
             
             uw_fisher = fisher_calculator.compute_uncertainty_weighted_fisher(
-                sequential_loader, uncertainty_weights, max_batches
+                sequential_loader,
+                uncertainty_weights,
+                max_batches,
+                use_batch_approx=True,
+                subsample_ratio=subsample_ratio,  # FAST mode: configurable subsampling
             )
             uncertainty_weighted_fishers.append(uw_fisher)
             

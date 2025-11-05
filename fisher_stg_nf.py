@@ -137,7 +137,8 @@ class FisherSTGNF:
     
     def _compute_uncertainty_weighted_fisher_for_batch(self, batch_data: Tuple,
                                                       name_param: List[Tuple[str, torch.nn.Parameter]],
-                                                      uncertainty_weights: torch.Tensor) -> Dict[str, torch.Tensor]:
+                                                      uncertainty_weights: torch.Tensor,
+                                                      use_batch_approx: bool = True) -> Dict[str, torch.Tensor]:
         """Compute uncertainty-weighted Fisher Information for a single batch."""
         data, labels, scores = batch_data[:3]
 
@@ -151,24 +152,57 @@ class FisherSTGNF:
         fisher_dict = {name: torch.zeros_like(param, device=self.device)
                        for name, param in name_param}
 
-        # Process each sample in the batch
-        for b in range(batch_size):
-            sample_data = data[b:b+1]
-            sample_label = labels[b:b+1]
-            sample_score = scores[b:b+1]
-            sample_weight = uncertainty_weights[b]
+        if use_batch_approx:
+            # FAST APPROXIMATION: compute batch-level gradients once, weighted by uncertainty
+            variables = [param for _, param in name_param]
 
-            sample_fishers = self._compute_fisher_single_sample(
-                sample_data, sample_label, sample_score, name_param, self.args
+            # Clear existing gradients
+            for param in variables:
+                if param.grad is not None:
+                    param.grad = None
+
+            if getattr(self.args, "model_confidence", False):
+                samp = data
+            else:
+                samp = data[:, :2]
+
+            _, nll = self.model(samp.float(), label=labels, score=scores)
+            if getattr(self.args, "model_confidence", False):
+                nll = nll * scores
+
+            weight_view = uncertainty_weights.view([-1] + [1] * (nll.ndim - 1))
+            weighted_loss = (nll * weight_view).mean()
+
+            grads = torch.autograd.grad(
+                outputs=weighted_loss,
+                inputs=variables,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
             )
 
-            # Weight Fisher information by uncertainty weight
-            for name in fisher_dict:
-                fisher_dict[name] += sample_fishers[name] * sample_weight
+            for (name, _), grad in zip(name_param, grads):
+                if grad is not None:
+                    fisher_dict[name] = grad.pow(2)
+        else:
+            # SLOW EXACT: Process each sample individually (original method)
+            for b in range(batch_size):
+                sample_data = data[b:b+1]
+                sample_label = labels[b:b+1]
+                sample_score = scores[b:b+1]
+                sample_weight = uncertainty_weights[b]
 
-        # Average over batch size
-        for name in fisher_dict:
-            fisher_dict[name] /= batch_size
+                sample_fishers = self._compute_fisher_single_sample(
+                    sample_data, sample_label, sample_score, name_param, self.args
+                )
+
+                # Weight Fisher information by uncertainty weight
+                for name in fisher_dict:
+                    fisher_dict[name] += sample_fishers[name] * sample_weight
+
+            # Average over batch size
+            for name in fisher_dict:
+                fisher_dict[name] /= batch_size
 
         return fisher_dict
 
@@ -220,9 +254,11 @@ class FisherSTGNF:
         return fishers
 
     def compute_uncertainty_weighted_fisher(self, dataloader, uncertainty_weights: torch.Tensor, 
-                                          max_batches: int = 100) -> Dict[str, torch.Tensor]:
+                                          max_batches: int = 100, use_batch_approx: bool = True, 
+                                          subsample_ratio: float = 1.0) -> Dict[str, torch.Tensor]:
         """Compute Fisher Information Matrix weighted by epistemic uncertainty."""
-        self.logger.info("Computing Uncertainty-Weighted Fisher Information Matrix for STG-NF model...")
+        mode_str = "FAST (batch approx)" if use_batch_approx else "EXACT (sample-wise)"
+        self.logger.info(f"Computing Uncertainty-Weighted Fisher [{mode_str}] for STG-NF model...")
 
         name_param = self._mergeable_name_param()
         self.logger.info(f"Found {len(name_param)} mergeable parameters")
@@ -234,10 +270,16 @@ class FisherSTGNF:
         n_batches = 0
         sample_idx = 0
 
+        # Apply subsampling
+        effective_max_batches = max(1, int(max_batches * subsample_ratio))
+        if subsample_ratio < 1.0:
+            self.logger.info(f"Using subsampling: {effective_max_batches}/{max_batches} batches")
+
         # Process data in batches
-        for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Computing UW-Fisher", leave=False)):
-            if batch_idx >= max_batches:
-                self.logger.info(f"Reached maximum batches limit ({max_batches})")
+        desc = f"UW-Fisher[{'FAST' if use_batch_approx else 'EXACT'}]"
+        for batch_idx, batch_data in enumerate(tqdm(dataloader, desc=desc, leave=False)):
+            if batch_idx >= effective_max_batches:
+                self.logger.info(f"Reached maximum batches limit ({effective_max_batches})")
                 break
                 
             try:
@@ -251,7 +293,7 @@ class FisherSTGNF:
                     break
                 
                 batch_fishers = self._compute_uncertainty_weighted_fisher_for_batch(
-                    batch_data, name_param, batch_weights)
+                    batch_data, name_param, batch_weights, use_batch_approx)
 
                 for name in fishers:
                     fishers[name] += batch_fishers[name].detach()
@@ -260,7 +302,7 @@ class FisherSTGNF:
                 sample_idx += batch_size
 
                 # Clear cache periodically
-                if batch_idx % 10 == 0:
+                if batch_idx % 5 == 0:  # More frequent cache clearing
                     torch.cuda.empty_cache()
                     
             except torch.cuda.OutOfMemoryError:

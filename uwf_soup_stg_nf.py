@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_weightings", type=int, default=10, help="Number of coefficient candidates")
     parser.add_argument("--max_batches", type=int, default=100, help="Max batches for uncertainty/Fisher computation")
     parser.add_argument("--fisher_floor", type=float, default=1e-6, help="Minimum Fisher weight")
+    parser.add_argument("--subsample_ratio", type=float, default=0.5, help="Subsample ratio for UW-Fisher (0,1]")
     parser.add_argument("--no_normalize_fishers", action="store_true", help="Disable Fisher normalization")
     parser.add_argument("--no_favor_target", action="store_true", help="Disable favoring the target model")
     parser.add_argument("--log_level", default="INFO", help="Logging level (INFO/DEBUG/...)")
@@ -113,6 +114,7 @@ def main():
         combined_mask=combined_mask,
         max_batches=args.max_batches,
         print_results=True,
+        subsample_ratio=args.subsample_ratio,
     )
 
     metadata = {
