@@ -77,8 +77,9 @@ class EpistemicUncertainty:
         self.logger.info(f"Computed log-likelihoods for {len(sample_indices)} samples")
         return model_logps
     
-    def compute_epistemic_uncertainty(self, model_logps: Dict[str, torch.Tensor], 
-                                    eps: float = 1e-8) -> torch.Tensor:
+    def compute_epistemic_uncertainty(self, model_logps: Dict[str, torch.Tensor],
+                                      eps: float = 1e-8,
+                                      unbiased: bool = True) -> torch.Tensor:
         """에피스테믹 불확실성(모델 간 분산) 계산"""
         self.logger.info("Computing epistemic uncertainty (model variance)...")
         
@@ -86,7 +87,7 @@ class EpistemicUncertainty:
         logp_stack = torch.stack([model_logps[f"model_{i}"] for i in range(self.n_models)], dim=0)
         
         # 샘플별 모델 간 분산 계산
-        epistemic_var = torch.var(logp_stack, dim=0, unbiased=True)
+        epistemic_var = torch.var(logp_stack, dim=0, unbiased=unbiased)
         
         # 불확실성이 너무 작으면 안정성을 위해 최소값 설정
         epistemic_var = torch.clamp(epistemic_var, min=eps)

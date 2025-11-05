@@ -1,6 +1,8 @@
 import copy
 import logging
 import os
+import math
+import re
 from collections import namedtuple
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -24,6 +26,9 @@ class FisherSoupSTGNF:
         self.device = device
         self.logger = logger or logging.getLogger(__name__)
         self.model_args = copy.deepcopy(model_args) if model_args is not None else None
+        self.last_uncertainty_var_stats: Optional[Dict[str, float]] = None
+        self.last_uncertainty_weight_stats: Optional[Dict[str, float]] = None
+        self.last_uncertainty_weights: Optional[torch.Tensor] = None
     
     def print_merge_result(self, result: MergeResult):
         """Print merge result in a readable format."""
@@ -66,6 +71,116 @@ class FisherSoupSTGNF:
                                           "num_batches_tracked", "prior_h"]):
             return True
         return False
+
+    def calibrate_actnorm(self, model: STG_NF, data_loader, max_batches: int, args) -> None:
+        """Lightweight ActNorm calibration without full retraining."""
+        if max_batches <= 0 or not hasattr(model, "set_actnorm_init"):
+            return
+        model.set_actnorm_init()
+        model.train()
+        processed = 0
+        with torch.no_grad():
+            for data_arr in data_loader:
+                data = [d.to(self.device, non_blocking=True) for d in data_arr]
+                score = data[-2].amin(dim=-1)
+                if getattr(args, 'model_confidence', False):
+                    samp = data[0]
+                else:
+                    samp = data[0][:, :2]
+                label = torch.ones(samp.shape[0], device=self.device)
+                model(samp.float(), label=label, score=score)
+                processed += 1
+                if processed >= max_batches:
+                    break
+        model.eval()
+
+    @staticmethod
+    def _safe_corrcoef(x: torch.Tensor, y: torch.Tensor) -> float:
+        if x.numel() <= 1 or y.numel() <= 1:
+            return float("nan")
+        x_center = x - x.mean()
+        y_center = y - y.mean()
+        denom = x_center.norm() * y_center.norm()
+        if denom <= 0:
+            return float("nan")
+        return float((x_center * y_center).sum() / denom)
+
+    def _stabilize_uncertainty_weights(self,
+                                       epistemic_var: torch.Tensor,
+                                       eps: float,
+                                       shrink_alpha: float,
+                                       gamma: float,
+                                       qclip: float,
+                                       wmin: float,
+                                       wmax: Optional[float]) -> Tuple[torch.Tensor, Dict[str, float]]:
+        var = epistemic_var.clone()
+        shrink_alpha = max(0.0, min(1.0, shrink_alpha))
+        if shrink_alpha > 0.0:
+            mean_var = var.mean()
+            var = (1.0 - shrink_alpha) * var + shrink_alpha * mean_var
+
+        var = torch.clamp(var, min=eps)
+
+        gamma = max(gamma, 0.0)
+        if math.isclose(gamma, 0.0, rel_tol=1e-6):
+            weights = torch.ones_like(var)
+        else:
+            weights = torch.pow(var, -gamma)
+
+        if qclip is not None and 0.0 < qclip < 100.0:
+            threshold = torch.quantile(weights, qclip / 100.0)
+            weights = torch.clamp(weights, max=threshold)
+
+        if wmax is None or wmax <= 0.0:
+            wmax = float("inf")
+        wmin = max(wmin, eps)
+        weights = torch.clamp(weights, min=wmin, max=wmax)
+
+        weights = weights / weights.mean().clamp_min(eps)
+
+        stats = {
+            "mean": float(weights.mean().item()),
+            "std": float(weights.std(unbiased=False).item()),
+            "min": float(weights.min().item()),
+            "max": float(weights.max().item()),
+            "q10": float(torch.quantile(weights, 0.10).item()),
+            "q50": float(torch.quantile(weights, 0.50).item()),
+            "q90": float(torch.quantile(weights, 0.90).item()),
+            "corr": float(self._safe_corrcoef(var, weights)),
+        }
+        return weights, stats
+
+    @staticmethod
+    def _mix_uniform_with_fisher(fisher_dict: Dict[str, torch.Tensor], eta: float) -> Dict[str, torch.Tensor]:
+        if eta <= 0.0:
+            return fisher_dict
+        eta = min(1.0, max(0.0, eta))
+        mixed: Dict[str, torch.Tensor] = {}
+        for name, tensor in fisher_dict.items():
+            uniform = torch.ones_like(tensor)
+            mixed[name] = eta * uniform + (1.0 - eta) * tensor
+        return mixed
+
+    @staticmethod
+    def _adjust_sensitive_fisher(fisher_dict: Dict[str, torch.Tensor],
+                                 pattern: Optional[re.Pattern],
+                                 gamma: float,
+                                 qclip: float) -> Dict[str, torch.Tensor]:
+        if pattern is None:
+            return fisher_dict
+        adjusted: Dict[str, torch.Tensor] = {}
+        for name, tensor in fisher_dict.items():
+            if pattern.search(name):
+                adjusted_tensor = tensor
+                if gamma not in (None, 1.0):
+                    adjusted_tensor = torch.clamp(adjusted_tensor, min=0).pow(gamma)
+                if qclip is not None and 0.0 < qclip < 100.0:
+                    threshold = torch.quantile(adjusted_tensor.flatten(), qclip / 100.0)
+                    adjusted_tensor = torch.clamp(adjusted_tensor, max=threshold)
+                adjusted[name] = adjusted_tensor
+            else:
+                adjusted[name] = tensor
+        return adjusted
     
     def _merge_with_coeffs(self, 
                           models: List[STG_NF],
@@ -359,6 +474,20 @@ class FisherSoupSTGNF:
                 loader_kwargs["prefetch_factor"] = prefetch_factor
             return DataLoader(loader.dataset, **loader_kwargs)
         
+        # Pull UW/Fisher stabilization parameters from args
+        uw_unbiased = bool(getattr(args, "uw_var_unbiased", False))
+        shrink_alpha = float(getattr(args, "uw_shrink_alpha", 0.0))
+        uw_gamma = float(getattr(args, "uw_gamma", 1.0))
+        uw_qclip = float(getattr(args, "uw_qclip", 100.0))
+        uw_wmin = float(getattr(args, "uw_wmin", 0.0))
+        uw_wmax = getattr(args, "uw_wmax", 0.0)
+        fisher_mix_eta = float(getattr(args, "fisher_mix_eta", 0.0))
+        sens_regex = getattr(args, "sens_regex", "")
+        sens_pattern = re.compile(sens_regex) if sens_regex else None
+        sens_gamma = float(getattr(args, "sens_fisher_gamma", 1.0))
+        sens_qclip = float(getattr(args, "sens_fisher_qclip", 100.0))
+        actnorm_steps = int(getattr(args, "actnorm_after_steps", 0))
+
         # Ensure deterministic ordering between uncertainty estimation and Fisher passes
         sequential_loader = _build_sequential_loader(dataloader)
 
@@ -367,10 +496,42 @@ class FisherSoupSTGNF:
         
         uncertainty_calculator = EpistemicUncertainty(models, self.device, self.logger)
         model_logps = uncertainty_calculator.compute_log_likelihoods(sequential_loader, args, max_batches)
-        epistemic_var = uncertainty_calculator.compute_epistemic_uncertainty(model_logps)
-        uncertainty_weights = uncertainty_calculator.compute_uncertainty_weights(epistemic_var)
+        epistemic_var = uncertainty_calculator.compute_epistemic_uncertainty(
+            model_logps, unbiased=uw_unbiased)
+
+        var_stats = {
+            "mean": float(epistemic_var.mean().item()),
+            "std": float(epistemic_var.std(unbiased=False).item()),
+            "min": float(epistemic_var.min().item()),
+            "max": float(epistemic_var.max().item()),
+            "q10": float(torch.quantile(epistemic_var, 0.10).item()),
+            "q50": float(torch.quantile(epistemic_var, 0.50).item()),
+            "q90": float(torch.quantile(epistemic_var, 0.90).item()),
+        }
+
+        uncertainty_weights, weight_stats = self._stabilize_uncertainty_weights(
+            epistemic_var,
+            eps=1e-8,
+            shrink_alpha=shrink_alpha,
+            gamma=uw_gamma,
+            qclip=uw_qclip,
+            wmin=uw_wmin,
+            wmax=uw_wmax if uw_wmax > 0.0 else None,
+        )
+
+        self.last_uncertainty_var_stats = var_stats
+        self.last_uncertainty_weight_stats = weight_stats
+        self.last_uncertainty_weights = uncertainty_weights
         
-        self.logger.info(f"Computed uncertainty weights for {len(uncertainty_weights)} samples")
+        self.logger.info(
+            "Computed uncertainty weights for %d samples | mean=%.4f std=%.4f min=%.4f max=%.4f corr=%.4f",
+            len(uncertainty_weights),
+            weight_stats["mean"],
+            weight_stats["std"],
+            weight_stats["min"],
+            weight_stats["max"],
+            weight_stats["corr"],
+        )
         
         # Step 2: Compute uncertainty-weighted Fisher information for each model
         from fisher_stg_nf import FisherSTGNF
@@ -387,6 +548,8 @@ class FisherSoupSTGNF:
                 use_batch_approx=True,
                 subsample_ratio=subsample_ratio,  # FAST mode: configurable subsampling
             )
+            uw_fisher = self._mix_uniform_with_fisher(uw_fisher, fisher_mix_eta)
+            uw_fisher = self._adjust_sensitive_fisher(uw_fisher, sens_pattern, sens_gamma, sens_qclip)
             uncertainty_weighted_fishers.append(uw_fisher)
             
             # Clear cache
@@ -436,6 +599,10 @@ class FisherSoupSTGNF:
         _, best_model = next(merged_iter)
         if combined_mask is not None:
             self.apply_mask_to_model(best_model, combined_mask)
+
+        if actnorm_steps > 0 and test_loader is not None:
+            self.logger.info("Calibrating ActNorm for %d steps...", actnorm_steps)
+            self.calibrate_actnorm(best_model, test_loader, actnorm_steps, args)
 
         return results, best_result, best_model
 

@@ -58,6 +58,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_batches", type=int, default=100, help="Max batches for uncertainty/Fisher computation")
     parser.add_argument("--fisher_floor", type=float, default=1e-6, help="Minimum Fisher weight")
     parser.add_argument("--subsample_ratio", type=float, default=0.5, help="Subsample ratio for UW-Fisher (0,1]")
+    parser.add_argument("--uw_var_unbiased", action="store_true", help="Use unbiased variance estimate")
+    parser.add_argument("--uw_shrink_alpha", type=float, default=0.0, help="Shrinkage coefficient towards mean variance")
+    parser.add_argument("--uw_gamma", type=float, default=1.0, help="Power applied to 1/var (w = var^-gamma)")
+    parser.add_argument("--uw_qclip", type=float, default=99.5, help="Quantile clip for uncertainty weights (0-100)")
+    parser.add_argument("--uw_wmin", type=float, default=0.1, help="Minimum uncertainty weight after normalization")
+    parser.add_argument("--uw_wmax", type=float, default=5.0, help="Maximum uncertainty weight (<=0 disables)")
+    parser.add_argument("--fisher_mix_eta", type=float, default=0.0, help="Mix ratio with uniform Fisher (0-1)")
+    parser.add_argument("--sens_regex", type=str, default="", help="Regex for sensitive params needing special Fisher scaling")
+    parser.add_argument("--sens_fisher_gamma", type=float, default=1.0, help="Gamma for sensitive parameter Fisher scaling")
+    parser.add_argument("--sens_fisher_qclip", type=float, default=100.0, help="Quantile clip for sensitive Fisher")
+    parser.add_argument("--actnorm_after_steps", type=int, default=0, help="ActNorm calibration steps after merging")
     parser.add_argument("--no_normalize_fishers", action="store_true", help="Disable Fisher normalization")
     parser.add_argument("--no_favor_target", action="store_true", help="Disable favoring the target model")
     parser.add_argument("--log_level", default="INFO", help="Logging level (INFO/DEBUG/...)")
@@ -74,6 +85,20 @@ def main():
     if args.device:
         ref_args.device = args.device
     ref_args.only_test = False
+    for attr in [
+        "uw_var_unbiased",
+        "uw_shrink_alpha",
+        "uw_gamma",
+        "uw_qclip",
+        "uw_wmin",
+        "uw_wmax",
+        "fisher_mix_eta",
+        "sens_regex",
+        "sens_fisher_gamma",
+        "sens_fisher_qclip",
+        "actnorm_after_steps",
+    ]:
+        setattr(ref_args, attr, getattr(args, attr))
 
     ref_args, model_args = init_sub_args(ref_args)
     dataset, loader = get_dataset_and_loader(ref_args, trans_list=trans_list, only_test=False)
@@ -123,12 +148,28 @@ def main():
         "checkpoints": [str(p) for p in args.checkpoints],
         "n_weightings": args.n_weightings,
         "max_batches": args.max_batches,
+        "subsample_ratio": args.subsample_ratio,
         "fisher_floor": args.fisher_floor,
         "favor_target_model": not args.no_favor_target,
         "normalize_fishers": not args.no_normalize_fishers,
+        "uw_var_unbiased": args.uw_var_unbiased,
+        "uw_shrink_alpha": args.uw_shrink_alpha,
+        "uw_gamma": args.uw_gamma,
+        "uw_qclip": args.uw_qclip,
+        "uw_wmin": args.uw_wmin,
+        "uw_wmax": args.uw_wmax,
+        "fisher_mix_eta": args.fisher_mix_eta,
+        "sens_regex": args.sens_regex,
+        "sens_fisher_gamma": args.sens_fisher_gamma,
+        "sens_fisher_qclip": args.sens_fisher_qclip,
+        "actnorm_after_steps": args.actnorm_after_steps,
         "best_coefficients": [float(c) for c in best_result.coefficients],
         "best_score": best_result.score,
     }
+    if getattr(fisher_soup, "last_uncertainty_var_stats", None):
+        metadata["uncertainty_var_stats"] = fisher_soup.last_uncertainty_var_stats
+    if getattr(fisher_soup, "last_uncertainty_weight_stats", None):
+        metadata["uncertainty_weight_stats"] = fisher_soup.last_uncertainty_weight_stats
 
     payload = {
         "state_dict": best_model.state_dict(),
