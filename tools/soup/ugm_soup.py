@@ -520,6 +520,14 @@ def main():
         metrics = _evaluate_state_dict(
             merged_state, model_args, ref_args, test_loader, dataset_test, device, logger, args.f1_threshold
         )
+        logger.info(
+            "Metrics for alphas %s | roc_auc=%.4f pr_auc=%.4f f1(th=%.3f)=%.4f",
+            alphas,
+            metrics.get("roc_auc", float("nan")),
+            metrics.get("pr_auc", float("nan")),
+            args.f1_threshold,
+            metrics.get("f1", float("nan")),
+        )
         metric_value = metrics.get(args.select_by)
         if metric_value is None:
             raise ValueError(f"Metric {args.select_by} not found in evaluation metrics.")
