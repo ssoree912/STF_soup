@@ -1,4 +1,4 @@
-name: STG-NF
+name: stg
 channels:
   - pytorch
   - defaults

@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 from argparse import Namespace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -7,6 +8,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from tqdm import tqdm
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from args import init_sub_args
 from dataset import get_dataset_and_loader

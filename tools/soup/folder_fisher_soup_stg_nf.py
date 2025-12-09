@@ -5,12 +5,12 @@ and automatically computes Fisher information before performing Fisher-weighted 
 """
 
 import argparse
-import logging
-import os
-import sys
-import random
 import gc
 import json
+import logging
+import os
+import random
+import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 from torch.utils.data import DataLoader, Subset
@@ -19,13 +19,17 @@ import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from args import init_sub_args
 from dataset import get_dataset_and_loader
 from models.STG_NF.model_pose import STG_NF
 from utils.data_utils import trans_list
 from utils.train_utils import init_model_params
-from fisher_stg_nf import FisherSTGNF, save_fisher_info
-from fisher_soup_stg_nf import FisherSoupSTGNF, load_models_and_fishers
+from tools.soup.fisher_stg_nf import FisherSTGNF, save_fisher_info
+from tools.soup.fisher_soup_stg_nf import FisherSoupSTGNF, load_models_and_fishers
 
 
 def setup_logger() -> logging.Logger:

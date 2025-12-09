@@ -25,6 +25,7 @@ import argparse
 import json
 import math
 import pickle
+import sys
 from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -32,10 +33,14 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 # --- project-local imports (same as your diagnose script) ---
 from args import init_sub_args
 from dataset import get_dataset_and_loader
-from fisher_soup_stg_nf import load_models_and_fishers
+from tools.soup.fisher_soup_stg_nf import load_models_and_fishers
 from models.STG_NF.model_pose import STG_NF
 from utils.data_utils import trans_list
 from utils.scoring_utils import score_dataset

@@ -3,7 +3,9 @@ import logging
 import os
 import math
 import re
+import sys
 from collections import namedtuple
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -12,8 +14,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, SequentialSampler
 from tqdm import tqdm
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from models.STG_NF.model_pose import STG_NF
-from fisher_stg_nf import FisherSTGNF, load_fisher_info
+from tools.soup.fisher_stg_nf import FisherSTGNF, load_fisher_info
 from utils.scoring_utils import score_dataset
 
 MergeResult = namedtuple("MergeResult", ["coefficients", "score"])
@@ -492,7 +498,7 @@ class FisherSoupSTGNF:
         sequential_loader = _build_sequential_loader(dataloader)
 
         # Step 1: Compute epistemic uncertainty
-        from epistemic_uncertainty import EpistemicUncertainty
+        from tools.soup.epistemic_uncertainty import EpistemicUncertainty
         
         uncertainty_calculator = EpistemicUncertainty(models, self.device, self.logger)
         model_logps = uncertainty_calculator.compute_log_likelihoods(sequential_loader, args, max_batches)
@@ -534,7 +540,7 @@ class FisherSoupSTGNF:
         )
         
         # Step 2: Compute uncertainty-weighted Fisher information for each model
-        from fisher_stg_nf import FisherSTGNF
+        from tools.soup.fisher_stg_nf import FisherSTGNF
         
         uncertainty_weighted_fishers = []
         for i, model in enumerate(models):

@@ -6,11 +6,17 @@ This script demonstrates how to use the UWF-Soup method with a simple example.
 """
 
 import logging
-import torch
+import sys
 from pathlib import Path
 
-from fisher_soup_stg_nf import FisherSoupSTGNF
-from epistemic_uncertainty import EpistemicUncertainty
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.soup.fisher_soup_stg_nf import FisherSoupSTGNF
+from tools.soup.epistemic_uncertainty import EpistemicUncertainty
 from models.STG_NF.model_pose import STG_NF
 
 
@@ -150,8 +156,8 @@ def main():
     logger.info("\nFor real usage:")
     logger.info("1. Load multiple trained STG-NF models from checkpoints")
     logger.info("2. Prepare your actual training/validation dataset")
-    logger.info("3. Use uwf_soup_stg_nf.py script for complete workflow")
-    logger.info("4. Example: python uwf_soup_stg_nf.py --folder_path /path/to/checkpoints --data_path /path/to/data")
+    logger.info("3. Use tools/soup/uwf_soup_stg_nf.py script for complete workflow")
+    logger.info("4. Example: python tools/soup/uwf_soup_stg_nf.py --folder_path /path/to/checkpoints --data_path /path/to/data")
 
 
 if __name__ == "__main__":
