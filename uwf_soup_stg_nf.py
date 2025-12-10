@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Run Uncertainty-Weighted Fisher Soup (UWF-Soup) for STG-NF checkpoints using the
-project's standard data/loading utilities and the enhanced FisherSoupSTGNF class.
+UWF-Soup 실행 스크립트(STG-NF).
+  - 불확실성 가중 Fisher 계산 후 소프 병합/평가
+예시:
+python uwf_soup_stg_nf.py --reference_args experiments/.../args.json \\
+  --checkpoints ckpt1.pth.tar ckpt2.pth.tar ckpt3.pth.tar \\
+  --output results/uwf/merged.pth.tar --device cuda:0
 """
 
 import argparse
@@ -13,7 +17,7 @@ from typing import Dict, List
 
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 

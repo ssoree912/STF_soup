@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Uncertainty-based Gradient Matching (UGM) soup for STG-NF checkpoints.
-
-Features
-- Merge checkpoints with diagonal Fisher information using UGM.
-- Optional grid search over alpha coefficients.
-- Optional evaluation on the standard dataset configuration (args.json).
+UGM 기반 STG-NF 소프 실행 스크립트.
+  - 대각 Fisher와 알파를 이용해 UGM 병합
+  - 그리드 서치/단일 알파, 평가까지 지원
+예시:
+python ugm_soup.py --reference_args experiments/.../args.json \\
+  --checkpoints ckpt1.pth.tar ckpt2.pth.tar \\
+  --fishers fisher1.pt fisher2.pt --alphas 0.5 0.5 \\
+  --output results/ugm/merged.pth.tar --evaluate
 """
 
 import argparse
@@ -21,7 +23,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 from sklearn.metrics import average_precision_score, f1_score
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 

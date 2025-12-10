@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Fisher Soup helper for STG-NF that takes model directories (containing best checkpoints)
-and automatically computes Fisher information before performing Fisher-weighted soup.
+폴더 단위 Fisher Soup 실행 스크립트(STG-NF).
+  - 폴더에서 ckpt/args.json을 찾아 Fisher 계산 후 소프 병합/평가
+예시:
+python folder_fisher_soup_stg_nf.py --folders run1 run2 run3 \\
+  --output results/nf_soup/merged.pth.tar --device cuda:0 --evaluate
 """
 
 import argparse
@@ -19,7 +22,7 @@ import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 

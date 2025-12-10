@@ -1,4 +1,4 @@
-# python tools/soup/uwf_soup_stg_nf.py \
+# python uwf_soup_stg_nf.py \
 # --reference_args experiments/ShanghaiTech/prune_mag0p025_rnd0p025_ep1/seed_100/rand_100/pruning_soup_run1/args.json \
 # --checkpoints experiments/ShanghaiTech/prune_mag0p025_rnd0p025_ep1/seed_100/rand_100/pruning_soup_run1/checkpoint_best.pth.tar \
 # 							  experiments/ShanghaiTech/prune_mag0p025_rnd0p025_ep1/seed_100/rand_101/pruning_soup_run2/checkpoint_best.pth.tar \
@@ -24,7 +24,7 @@
 #   --save_results_json \
 #    --sens_regex "actnorm|log_scale|log_s" a
 
-CUDA_VISIBLE_DEVICES=1 python tools/soup/uwf_soup_stg_nf.py \
+CUDA_VISIBLE_DEVICES=1 python uwf_soup_stg_nf.py \
 --reference_args experiments/ShanghaiTech/baseline/seed_100/rand_none/baseline_soup_run1/args.json \
 --checkpoints experiments/ShanghaiTech/baseline/seed_100/rand_none/baseline_soup_run1/checkpoint_best.pth.tar \
 							  experiments/ShanghaiTech/baseline/seed_101/rand_none/baseline_soup_run2/checkpoint_best.pth.tar \

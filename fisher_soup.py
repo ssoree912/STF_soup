@@ -1,3 +1,11 @@
+"""
+Fisher Soup 실행 스크립트(STG-NF 단순 병합).
+  - 지정된 ckpt/Fisher로 계수 탐색 후 병합/평가
+예시:
+python fisher_soup.py --checkpoints ckpt1 ckpt2 --fisher_paths f1 f2 \\
+  --reference_args experiments/.../args.json --output results/fisher_soup.pth.tar
+"""
+
 import argparse
 import json
 import sys
@@ -9,7 +17,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
