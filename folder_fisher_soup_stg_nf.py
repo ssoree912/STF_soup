@@ -208,6 +208,11 @@ def compute_fisher_for_checkpoint(checkpoint_path: Path,
 
     # Perform Fisher computation
     fisher_info = fisher_computer.compute_fisher_for_model(safe_loader, max_batches=args.fisher_max_batches)
+    if args.fisher_normalize:
+        for k, v in fisher_info.items():
+            norm = v.norm()
+            if norm > 0:
+                fisher_info[k] = v / norm
     
     # Save Fisher information
     fisher_output.parent.mkdir(parents=True, exist_ok=True)
@@ -239,6 +244,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_combinations", type=int, default=10)
     parser.add_argument("--random_seed", type=int, default=42)
     parser.add_argument("--fisher_floor", type=float, default=1e-6)
+    parser.add_argument("--fisher_normalize", action="store_true",
+                        help="L2 정규화하여 Fisher 스케일을 맞춤")
     parser.add_argument("--no_favor_target", action="store_true")
     parser.add_argument("--no_normalize_fishers", action="store_true")
     parser.add_argument("--evaluate", action="store_true")

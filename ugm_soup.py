@@ -100,6 +100,16 @@ def _load_fisher_raw(path: str):
     return torch.load(path, map_location="cpu")
 
 
+def _split_fisher_payload(raw) -> Tuple[Dict[str, torch.Tensor], Optional[Dict]]:
+    """
+    Fisher 파일이 {"fisher": ..., "metadata": ...} 형태면 분리하고,
+    그렇지 않으면 그대로 반환한다.
+    """
+    if isinstance(raw, dict) and "fisher" in raw:
+        return raw["fisher"], raw.get("metadata")
+    return raw, None
+
+
 def _extract_fisher_list(fisher_obj) -> Optional[List[torch.Tensor]]:
     if isinstance(fisher_obj, list):
         return fisher_obj
@@ -194,17 +204,20 @@ def _validate_keys(models: List[Dict[str, torch.Tensor]], fishers: List[Dict[str
     if model_keys != fisher_keys:
         raise ValueError("Model keys and Fisher keys must match one-to-one for UGM merging.")
 
-
+'''
+ref_tensor : θ_0 
+delta : Σ_k α_k * (H_0 + H_k) / (H_0 + Σ_j α_j * H_j) * (θ_k - θ_0)
+'''
 def ugm_merge_state_dicts(
-    models: List[Dict[str, torch.Tensor]],
-    fishers: List[Dict[str, torch.Tensor]],
-    alphas: torch.Tensor,
-    ref_idx: int = 0,
-    eps: float = 1e-8,
-    use_ref_fisher: bool = True,
+    models: List[Dict[str, torch.Tensor]], #각 모델 파라미터
+    fishers: List[Dict[str, torch.Tensor]], #각 모델의 diagonal fisher 정보
+    alphas: torch.Tensor, #각 모델의 가중치
+    ref_idx: int = 0, #참조 모델 인덱스() 참조 모델은 UGM 병합 시 기준이 되는 모델)
+    eps: float = 1e-8, #수치 안정성 상수
+    use_ref_fisher: bool = True, #참조 모델의 Fisher 사용 여부
 ) -> Dict[str, torch.Tensor]:
     """Merge multiple model state_dicts using uncertainty-based gradient matching."""
-    if len(models) != len(fishers):
+    if len(models) != len(fishers): 
         raise ValueError("Number of models and fishers must match.")
     if not models:
         raise ValueError("At least one model is required for merging.")
@@ -213,30 +226,30 @@ def ugm_merge_state_dicts(
 
     _validate_keys(models, fishers)
 
-    K = len(models)
-    alphas = torch.as_tensor(alphas, dtype=torch.float32)
+    K = len(models) #모델 개수
+    alphas = torch.as_tensor(alphas, dtype=torch.float32) #알파텐서 : 각 모델의 가중치
     if alphas.numel() != K:
         raise ValueError(f"alphas must have length {K}, got {alphas.numel()}.")
 
-    merged = copy.deepcopy(models[ref_idx])
-    ref_sd = models[ref_idx]
+    merged = copy.deepcopy(models[ref_idx]) #병합된 모델 파라미터
+    ref_sd = models[ref_idx] #참조 모델 파라미터
 
-    if use_ref_fisher:
-        H0_sd = fishers[ref_idx]
+    if use_ref_fisher: #참조 모델의 fisher 사용
+        H0_sd = fishers[ref_idx]  
     else:
-        H0_sd = {k: torch.full_like(v, eps) for k, v in ref_sd.items()}
+        H0_sd = {k: torch.full_like(v, eps) for k, v in ref_sd.items()} #참조 모델의 파라미터와 동일한 형태로 eps로 채운 딕셔너리 eps : 수치 안정성 상수
 
-    barH: Dict[str, torch.Tensor] = {}
-    for key in ref_sd.keys():
-        ref_tensor = ref_sd[key]
+    barH: Dict[str, torch.Tensor] = {} #병합된 모델의 Fisher 정보
+    for key in ref_sd.keys(): 
+        ref_tensor = ref_sd[key] 
         if not torch.is_tensor(ref_tensor) or not ref_tensor.is_floating_point():
             continue
 
-        fish = torch.stack([f[key] for f in fishers], dim=0)
-        a = alphas.view(K, *([1] * (fish.dim() - 1)))
-        bar = H0_sd[key].clone()
-        bar = bar + torch.sum(a * fish, dim=0)
-        barH[key] = bar.clamp_min(eps)
+        fish = torch.stack([f[key] for f in fishers], dim=0) #각 모델의 해당 파라미터에 대한 Fisher 정보를 스택
+        a = alphas.view(K, *([1] * (fish.dim() - 1))) #알파 텐서를 해당 파라미터의 차원에 맞게 리쉐이프
+        bar = H0_sd[key].clone() 
+        bar = bar + torch.sum(a * fish, dim=0) #각 모델의 Fisher 정보에 알파를 곱한 후 참조 모델의 Fisher 정보와 더함
+        barH[key] = bar.clamp_min(eps)#H_0 + Σ_k α_k * H_k
 
     for key in merged.keys():
         ref_tensor = ref_sd[key]
@@ -244,21 +257,21 @@ def ugm_merge_state_dicts(
             merged[key] = ref_tensor
             continue
 
-        fish = torch.stack([f[key] for f in fishers], dim=0)
-        params = torch.stack([m[key] for m in models], dim=0)
+        fish = torch.stack([f[key] for f in fishers], dim=0) #각 모델의 해당 파라미터에 대한 Fisher 정보를 스택
+        params = torch.stack([m[key] for m in models], dim=0) 
 
-        a = alphas.view(K, *([1] * (params.dim() - 1)))
+        a = alphas.view(K, *([1] * (params.dim() - 1))) 
 
-        H0 = H0_sd[key]
-        H0_plus_Ht = H0.unsqueeze(0) + fish
+        H0 = H0_sd[key] 
+        H0_plus_Ht = H0.unsqueeze(0) + fish #H_0 + H_k
 
-        denom = barH[key]
-        W = H0_plus_Ht / denom.unsqueeze(0)
+        denom = barH[key] #H_0 + Σ_j α_j * H_j
+        W = H0_plus_Ht / denom.unsqueeze(0) #(H_0 + H_k) / (H_0 + Σ_j α_j * H_j)
         weights = a * W
 
-        inc = params - ref_tensor.unsqueeze(0)
-        delta = torch.sum(weights * inc, dim=0)
-        merged[key] = ref_tensor + delta
+        inc = params - ref_tensor.unsqueeze(0) #(θ_k - θ_0) 
+        delta = torch.sum(weights * inc, dim=0) 
+        merged[key] = ref_tensor + delta 
 
     return merged
 
@@ -275,7 +288,7 @@ def merge_from_paths(
     apply_masks: bool = True,
     logger: Optional[logging.Logger] = None,
     save_output: bool = True,
-) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], List[Optional[Dict]]]:
     logger = logger or _setup_logger()
 
     if len(checkpoints) != len(fisher_paths):
@@ -284,10 +297,18 @@ def merge_from_paths(
     logger.info("Loading %d checkpoints and Fisher files...", len(checkpoints))
     models = [_load_state_dict(p) for p in checkpoints]
     raw_fishers = [_load_fisher_raw(p) for p in fisher_paths]
+    fisher_metas: List[Optional[Dict]] = []
     fishers = [
-        _normalize_fisher_to_state_dict(raw, model_state=sd, eps=eps)
+        _normalize_fisher_to_state_dict(
+            _split_fisher_payload(raw)[0],
+            model_state=sd,
+            eps=eps,
+        )
         for raw, sd in zip(raw_fishers, models)
     ]
+    for raw in raw_fishers:
+        _, meta = _split_fisher_payload(raw)
+        fisher_metas.append(meta)
 
     masks = [_load_mask(p, mask_name, logger) for p in checkpoints]
     combined_mask = _combine_masks(masks)
@@ -309,7 +330,7 @@ def merge_from_paths(
         torch.save(merged, output_path)
         logger.info("Saved UGM-merged checkpoint to %s", output_path)
 
-    return merged, combined_mask
+    return merged, combined_mask, fisher_metas
 
 
 def _load_reference_args(path: Path) -> argparse.Namespace:
@@ -443,7 +464,7 @@ def main():
 
     # Single merge mode
     if not args.grid_search:
-        merged_state, combined_mask = merge_from_paths(
+        merged_state, combined_mask, fisher_metas = merge_from_paths(
             checkpoints=args.checkpoints,
             fisher_paths=args.fishers,
             alphas=args.alphas,
@@ -476,6 +497,7 @@ def main():
             "alphas": [float(a) for a in args.alphas],
             "mask_applied": bool(combined_mask is not None and apply_masks),
             "f1_threshold": float(args.f1_threshold),
+            "fisher_meta": fisher_metas,
             **metrics,
         }
         with open(metrics_path, "w") as handle:
@@ -492,6 +514,8 @@ def main():
     best_alphas: Optional[List[float]] = None
     best_state: Optional[Dict[str, torch.Tensor]] = None
     best_mask: Optional[Dict[str, torch.Tensor]] = None
+    best_fisher_meta: Optional[List[Optional[Dict]]] = None
+    combo_logs: List[Dict] = []
 
     for combo in itertools.product(grid_values, repeat=K):
         combo = list(combo)
@@ -505,7 +529,7 @@ def main():
 
         logger.info("Trying alphas: %s", alphas)
 
-        merged_state, combined_mask = merge_from_paths(
+        merged_state, combined_mask, fisher_metas = merge_from_paths(
             checkpoints=args.checkpoints,
             fisher_paths=args.fishers,
             alphas=alphas,
@@ -530,6 +554,12 @@ def main():
             args.f1_threshold,
             metrics.get("f1", float("nan")),
         )
+        combo_logs.append({
+            "alphas": [float(a) for a in alphas],
+            "mask_applied": bool(combined_mask is not None and apply_masks),
+            "metrics": metrics,
+            "fisher_meta": fisher_metas,
+        })
         metric_value = metrics.get(args.select_by)
         if metric_value is None:
             raise ValueError(f"Metric {args.select_by} not found in evaluation metrics.")
@@ -539,6 +569,7 @@ def main():
             best_alphas = alphas
             best_state = merged_state
             best_mask = combined_mask
+            best_fisher_meta = fisher_metas
             logger.info("New best %s = %.4f with alphas %s", args.select_by, metric_value, alphas)
 
     if best_state is None or best_metrics is None or best_alphas is None:
@@ -557,6 +588,8 @@ def main():
         "alphas": [float(a) for a in best_alphas],
         "mask_applied": bool(best_mask is not None and apply_masks),
         "f1_threshold": float(args.f1_threshold),
+        "combo_logs": combo_logs,
+        "best_fisher_meta": best_fisher_meta,
         **best_metrics,
     }
     with open(metrics_path, "w") as handle:
