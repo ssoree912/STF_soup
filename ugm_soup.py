@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
-from sklearn.metrics import average_precision_score, f1_score
+from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -394,9 +394,9 @@ def _evaluate_state_dict(
     soup_helper = FisherSoupSTGNF(device, logger, model_args=model_args)
     eval_result = soup_helper.evaluate_model(model, test_loader, dataset_test, ref_args)
 
-    scores_np = eval_result["scores"]
-    labels_np = eval_result["labels"]
-    roc_auc = float(eval_result["roc_auc"])
+    scores_np = eval_result["scores"].ravel()
+    labels_np = eval_result["labels"].ravel()
+    roc_auc = float(roc_auc_score(labels_np, scores_np))
     pr_auc = float(average_precision_score(labels_np, scores_np))
     f1 = float(f1_score(labels_np, scores_np >= f1_threshold))
 
@@ -516,6 +516,7 @@ def main():
     best_mask: Optional[Dict[str, torch.Tensor]] = None
     best_fisher_meta: Optional[List[Optional[Dict]]] = None
     combo_logs: List[Dict] = []
+    seen_alphas = set()
 
     for combo in itertools.product(grid_values, repeat=K):
         combo = list(combo)
@@ -526,6 +527,11 @@ def main():
             alphas = [c / s for c in combo]
         else:
             alphas = combo
+
+        key = tuple(round(float(a), 6) for a in alphas)
+        if key in seen_alphas:
+            continue
+        seen_alphas.add(key)
 
         logger.info("Trying alphas: %s", alphas)
 

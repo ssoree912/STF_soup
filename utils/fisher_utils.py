@@ -14,7 +14,9 @@ def _zero_fisher_like(model: torch.nn.Module):
 
 def compute_occ_fisher(model, loader, device, max_batches=50, fisher_floor=1e-8, normalize=False):
     """
-    Estimate diagonal Fisher information for STG-NF style models.
+    배치 단위로 모델의 피서 정보 계산
+    수식 : F_i = E_data[(∂/∂θ_i log p(x|θ))^2]
+
     """
     model.eval()
     device = torch.device(device)

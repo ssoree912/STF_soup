@@ -407,7 +407,10 @@ def save_metadata(output_dir: Path, metadata: Dict) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fisher Soup model combiner")
-    parser.add_argument("--run_dirs", nargs="+", required=True, help="Run directories containing checkpoints and fisher_diag.pt")
+    parser.add_argument("--run_dirs", nargs="+", default=None, help="Run directories containing checkpoints and fisher files")
+    parser.add_argument("--checkpoints", nargs="+", default=None, help="Explicit checkpoint paths (alternative to --run_dirs)")
+    parser.add_argument("--fishers", nargs="+", default=None, help="Explicit Fisher paths aligned with --checkpoints")
+    parser.add_argument("--reference_args", default=None, help="args.json path (required when using --checkpoints and evaluating)")
     parser.add_argument("--output_path", required=True, help="Path to save the combined soup checkpoint (.pth.tar)")
     parser.add_argument("--method", choices=["fisher", "uniform"], default="fisher", help="Combination strategy")
     parser.add_argument("--checkpoint_name", default=None, help="Specific checkpoint file name inside each run dir")
@@ -429,18 +432,58 @@ def parse_args():
 
 def main():
     args = parse_args()
-    run_dirs = [Path(run_dir).expanduser().resolve() for run_dir in args.run_dirs]
-    for run_dir in run_dirs:
-        if not run_dir.exists():
-            raise FileNotFoundError(f"Run directory not found: {run_dir}")
+    states: List[Dict[str, torch.Tensor]] = []
+    fishers: List[Dict[str, torch.Tensor]] = []
+    member_meta: List[Dict] = []
+    reference_args_path: Optional[Path] = None
 
-    states, fishers, member_meta = load_states_and_fishers(
-        run_dirs=run_dirs,
-        checkpoint_name=args.checkpoint_name,
-        fisher_name=args.fisher_name,
-        checkpoint_pattern=args.checkpoint_pattern,
-        fisher_pattern=args.fisher_pattern,
-    )
+    if args.checkpoints is not None:
+        if args.fishers is not None and len(args.checkpoints) != len(args.fishers):
+            raise ValueError("--checkpoints and --fishers must have the same length")
+        checkpoint_paths = [Path(p).expanduser().resolve() for p in args.checkpoints]
+        fisher_paths = [Path(p).expanduser().resolve() for p in args.fishers] if args.fishers is not None else [None] * len(checkpoint_paths)
+
+        for ckpt_path, fisher_path in zip(checkpoint_paths, fisher_paths):
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+            state_dict = _load_checkpoint(ckpt_path)
+            states.append(state_dict)
+
+            fisher_dict = {}
+            fisher_meta = {}
+            if fisher_path is not None:
+                if not fisher_path.exists():
+                    raise FileNotFoundError(f"Fisher not found: {fisher_path}")
+                fisher_dict, fisher_meta = _load_fisher(fisher_path)
+            fishers.append(fisher_dict)
+            member_meta.append({
+                "run_dir": None,
+                "checkpoint": str(ckpt_path),
+                "fisher": str(fisher_path) if fisher_path is not None else None,
+                "fisher_meta": fisher_meta,
+            })
+
+        if args.evaluate:
+            if args.reference_args is None:
+                raise ValueError("--reference_args is required when evaluating with explicit --checkpoints")
+            reference_args_path = Path(args.reference_args).expanduser().resolve()
+    else:
+        if args.run_dirs is None:
+            raise ValueError("Either --run_dirs or --checkpoints must be provided")
+        run_dirs = [Path(run_dir).expanduser().resolve() for run_dir in args.run_dirs]
+        for run_dir in run_dirs:
+            if not run_dir.exists():
+                raise FileNotFoundError(f"Run directory not found: {run_dir}")
+
+        states, fishers, member_meta = load_states_and_fishers(
+            run_dirs=run_dirs,
+            checkpoint_name=args.checkpoint_name,
+            fisher_name=args.fisher_name,
+            checkpoint_pattern=args.checkpoint_pattern,
+            fisher_pattern=args.fisher_pattern,
+        )
+        if args.evaluate and reference_args_path is None:
+            reference_args_path = run_dirs[0] / "args.json"
 
     n_models = len(states)
     if n_models == 0:
@@ -461,7 +504,8 @@ def main():
     best_auc = float("-inf")
     best_eval_payload = None
     search_results = []
-    reference_args_path = run_dirs[0] / "args.json"
+    if reference_args_path is None:
+        reference_args_path = run_dirs[0] / "args.json"
 
     for coeffs in coefficient_sets:
         combined_state, aggregated_fisher = _combine_with_coeffs(

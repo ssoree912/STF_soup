@@ -217,6 +217,17 @@ def main():
         logger.warning("subsample_ratio %.3f out of range (0,1]; using 1.0", args.subsample_ratio)
         args.subsample_ratio = 1.0
 
+    # Validate checkpoint paths early to avoid silent empty tokens
+    checkpoint_paths: List[Path] = []
+    for idx, raw_ckpt in enumerate(args.checkpoints):
+        ckpt_str = str(raw_ckpt).strip()
+        if not ckpt_str:
+            raise ValueError(f"--checkpoints entry at position {idx} is empty. CLI 공백/줄바꿈을 확인하세요.")
+        ckpt_path = Path(ckpt_str)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found at index {idx}: {ckpt_path}")
+        checkpoint_paths.append(ckpt_path)
+
     ref_args = load_reference_args(args.reference_args, args.device)
     ref_args, model_args = init_sub_args(ref_args)
     dataset, loader = get_dataset_and_loader(ref_args, trans_list=trans_list, only_test=False)
@@ -229,11 +240,11 @@ def main():
     device = torch.device(ref_args.device)
     seq_loader = build_sequential_loader(train_loader)
 
-    logger.info("Loading %d checkpoints...", len(args.checkpoints))
+    logger.info("Loading %d checkpoints...", len(checkpoint_paths))
     models: List[STG_NF] = []
     model_states: List[Dict[str, torch.Tensor]] = []
-    for ckpt in args.checkpoints:
-        model, state = load_model(Path(ckpt), model_args, device, logger)
+    for ckpt in checkpoint_paths:
+        model, state = load_model(ckpt, model_args, device, logger)
         models.append(model)
         model_states.append(state)
 
@@ -249,7 +260,7 @@ def main():
     )
 
     logger.info("Computing UW-Fisher for each checkpoint...")
-    for idx, (ckpt_path, model, state) in enumerate(zip(args.checkpoints, models, model_states)):
+    for idx, (ckpt_path, model, state) in enumerate(zip(checkpoint_paths, models, model_states)):
         fisher_calc = FisherSTGNF(model, device, logger, ref_args)
         uw_fisher = fisher_calc.compute_uncertainty_weighted_fisher(
             seq_loader,
