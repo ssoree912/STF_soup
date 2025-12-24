@@ -3,6 +3,12 @@ import json
 import os
 import pickle
 import random
+import sys
+
+# Ensure project root is on sys.path for local imports.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import numpy as np
 import torch
