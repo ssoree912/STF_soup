@@ -15,7 +15,7 @@ import torch
 from args import init_parser, init_sub_args
 from dataset import get_dataset_and_loader
 from utils.data_utils import trans_list
-from utils.scoring_utils import get_dataset_scores, score_auc
+from utils.scoring_utils import get_dataset_scores, score_auc, score_dataset
 from utils.unlearning_utils import eval_nll_on_indices, load_model_from_checkpoint
 
 
@@ -43,10 +43,9 @@ def best_f1(scores, gt):
 
 
 def eval_test_metrics(scores, dataset, args):
+    auc, scores_np = score_dataset(scores, dataset.metadata, args=args)
     gt_arr, scores_arr = get_dataset_scores(scores, dataset.metadata, args=args)
     gt_np = np.concatenate(gt_arr)
-    scores_np = np.concatenate(scores_arr)
-    auc = score_auc(scores_np, gt_np)
     from sklearn.metrics import average_precision_score
     auprc = average_precision_score(gt_np, scores_np)
     f1 = best_f1(scores_np, gt_np)
