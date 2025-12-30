@@ -22,7 +22,7 @@ from utils.unlearning_utils import (
     prepare_batch,
     reduce_conf_score,
 )
-from utils.scoring_utils import get_dataset_scores
+from utils.scoring_utils import get_dataset_scores, score_dataset
 
 # -------------------------
 # Utils
@@ -53,7 +53,7 @@ def build_indexed_loader(dataset: Dataset, indices: List[int], batch_size: int, 
 
 
 @torch.no_grad()
-def infer_scores(
+def infer_normality_scores(
     model,
     dataset: Dataset,
     indices: List[int],
@@ -65,7 +65,7 @@ def infer_scores(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
-      scores: (N,) anomaly score (higher = more anomalous). Here we use nll.
+      scores: (N,) normality score (higher = more normal). Here we use -nll.
       labels: (N,) raw labels from dataset
     """
     loader = build_indexed_loader(dataset, indices, batch_size, num_workers, shuffle=False)
@@ -88,12 +88,12 @@ def infer_scores(
         if torch.is_tensor(sids):
             sids = sids.tolist()
 
-        nll_np = nll.detach().cpu().numpy().astype(np.float32)
+        normal_np = (-1.0 * nll).detach().cpu().numpy().astype(np.float32)
         lab_np = label.detach().cpu().numpy().astype(np.int64)
 
         for j, sid in enumerate(sids):
             k = pos[int(sid)]
-            scores_out[k] = nll_np[j]
+            scores_out[k] = normal_np[j]
             labels_out[k] = lab_np[j]
 
     return scores_out, labels_out
@@ -153,9 +153,9 @@ def compute_auc_metrics(y_true: np.ndarray, score: np.ndarray) -> Dict[str, floa
     return out
 
 
-def best_f1(y_true: np.ndarray, score: np.ndarray) -> Dict[str, float]:
+def best_f1_label(y_true: np.ndarray, score: np.ndarray) -> Dict[str, float]:
     """
-    Find best F1 over thresholds on score.
+    Find best F1 over thresholds on score (label-based, anomaly score).
     """
     from sklearn.metrics import f1_score
 
@@ -175,17 +175,36 @@ def best_f1(y_true: np.ndarray, score: np.ndarray) -> Dict[str, float]:
     return {"f1": best[0], "thr": best[1]}
 
 
-def eval_metrics_with_gt(scores: np.ndarray, dataset, args) -> Dict[str, float]:
+def best_f1_quantile(scores: np.ndarray, gt: np.ndarray) -> Dict[str, float]:
     """
-    Evaluate with GT masks (normal=1, abnormal=0 in this codebase).
-    scores should be "normality" (higher = more normal), consistent with train_eval.
+    Match run_eval_plot.py: thresholds are quantiles in [0.01, 0.99].
+    scores: higher = more normal
+    gt: 1 = normal, 0 = abnormal
     """
-    gt_arr, scores_arr = get_dataset_scores(scores, dataset.metadata, args=args)
-    gt_np = np.concatenate(gt_arr)
-    scores_np = np.concatenate(scores_arr)
-    metrics = compute_auc_metrics(gt_np.astype(np.int32), scores_np)
-    f1 = best_f1(gt_np.astype(np.int32), scores_np)
-    return {**metrics, **f1}
+    from sklearn.metrics import f1_score
+    thresholds = np.quantile(scores, np.linspace(0.01, 0.99, 99))
+    best = (-1.0, thresholds[0])
+    for thr in thresholds:
+        pred = (scores >= thr).astype(np.int32)
+        f1 = f1_score(gt, pred, zero_division=0)
+        if f1 > best[0]:
+            best = (float(f1), float(thr))
+    return {"f1": best[0], "thr": best[1]}
+
+
+def eval_metrics_train_eval(scores: np.ndarray, dataset, args) -> Dict[str, float]:
+    """
+    Match train_eval.py / run_eval_plot.py:
+    - scores are normality (higher = more normal)
+    - scoring_utils.score_dataset applies smoothing and frame-level GT
+    """
+    auc, scores_np = score_dataset(scores, dataset.metadata, args=args)
+    gt_arr, _ = get_dataset_scores(scores, dataset.metadata, args=args)
+    gt_np = np.concatenate(gt_arr).astype(np.int32)
+    from sklearn.metrics import average_precision_score
+    auprc = average_precision_score(gt_np, scores_np)
+    f1 = best_f1_quantile(scores_np, gt_np)
+    return {"auc": float(auc), "auprc": float(auprc), **f1}
 
 
 def split_indices(n: int, val_ratio: float, seed: int) -> Tuple[List[int], List[int]]:
@@ -249,15 +268,18 @@ def parse_args():
                    help="ckpt paths (e.g., df1_retrain.pth.tar df2_retrain.pth.tar df3_retrain.pth.tar)")
     p.add_argument("--output_path", type=str, default="outputs/unlearning/ensemble_results.json")
     p.add_argument("--split", type=str, default="test", choices=["train", "test"])
+    p.add_argument("--scoring", type=str, default="train_eval", choices=["train_eval", "label"],
+                   help="train_eval: score_dataset(GT masks + smoothing) like train_eval.py; "
+                        "label: use dataset labels (anomaly = label != normal_label)")
     p.add_argument("--val_ratio_for_weights", type=float, default=0.0,
                    help=">0이면 split subset을 val로 떼서 weights search 후 test에 적용")
     p.add_argument("--val_seed", type=int, default=0)
     p.add_argument("--weight_grid_step", type=float, default=0.1)
     p.add_argument("--eval_with_gt", action="store_true",
-                   help="GT 마스크 기반 평가(ShanghaiTech/UBnormal test에 권장)")
+                   help="(deprecated) same as --scoring train_eval")
 
     p.add_argument("--use_conf_score", action="store_true",
-                   help="nll에 reduce_conf_score(score)를 곱할지 여부 (학습/캐시와 일치시켜야 함)")
+                   help="nll에 reduce_conf_score(score)를 곱할지 여부 (default: model_confidence)")
     p.add_argument("--normal_label", type=int, default=1,
                    help="dataset label 중 'normal'로 간주할 값. anomaly는 (label != normal_label)로 처리")
     return p.parse_args()
@@ -269,16 +291,22 @@ def main():
 
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
     device = torch.device(args.device)
+    scoring_mode = "train_eval" if args.eval_with_gt else args.scoring
+    split = args.split
+    if scoring_mode == "train_eval" and split != "test":
+        print("scoring=train_eval forces split=test (overriding --split).")
+        split = "test"
+    use_conf_score = bool(args.model_confidence or args.use_conf_score)
 
     # dataset
     dataset, _ = get_dataset_and_loader(args, trans_list=trans_list, only_test=False)
-    ds = dataset[args.split]
+    ds = dataset[split]
     indices = list(range(len(ds)))
 
     # optional: split subset for weight tuning
     val_idx = None
     test_idx = indices
-    if args.val_ratio_for_weights and args.val_ratio_for_weights > 0:
+    if scoring_mode != "train_eval" and args.val_ratio_for_weights and args.val_ratio_for_weights > 0:
         val_idx, test_idx = split_indices(len(ds), args.val_ratio_for_weights, args.val_seed)
 
     # load scores per model
@@ -288,7 +316,7 @@ def main():
     for ckpt in args.checkpoints:
         model = load_model_from_checkpoint(args, dataset, ckpt).to(device)
         # use full indices (to keep alignment), then slice
-        scores_all, labels_all = infer_scores(
+        scores_all, labels_all = infer_normality_scores(
             model=model,
             dataset=ds,
             indices=indices,
@@ -296,7 +324,7 @@ def main():
             model_confidence=args.model_confidence,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            use_conf_score=args.use_conf_score,
+            use_conf_score=use_conf_score,
         )
         name = os.path.basename(ckpt)
         scores_by_model[name] = scores_all
@@ -309,64 +337,56 @@ def main():
                 raise RuntimeError("Labels mismatch across runs. Dataset indexing may be inconsistent.")
 
     labels = labels_ref
-    labels_unique = np.unique(labels) if labels is not None else np.array([])
-    use_gt_eval = bool(args.eval_with_gt) or (labels_unique.size < 2)
-
-    if use_gt_eval:
-        val_idx = None
-        test_idx = indices
-        scores_by_model = {k: -v for k, v in scores_by_model.items()}
-        eval_mode = "gt_normality"
-    else:
-        eval_mode = "label_anomaly"
     y_true = (labels != int(args.normal_label)).astype(np.int32) if labels is not None else None
 
     # slice val/test
     def take(arr, idxs):
         return arr if idxs is None else arr[np.array(idxs, dtype=np.int64)]
 
-    y_test = take(y_true, test_idx) if y_true is not None else None
     model_names = list(scores_by_model.keys())
     scores_test_list = [take(scores_by_model[n], test_idx) for n in model_names]
 
     # base: report each model
     per_model = {}
-    for n, s in zip(model_names, scores_test_list):
-        if use_gt_eval:
-            per_model[n] = eval_metrics_with_gt(s, ds, args)
-        else:
+    if scoring_mode == "train_eval":
+        for n, s in zip(model_names, scores_test_list):
+            per_model[n] = eval_metrics_train_eval(s, ds, args)
+    else:
+        y_test = take(y_true, test_idx) if y_true is not None else None
+        scores_test_anom = [-s for s in scores_test_list]
+        for n, s in zip(model_names, scores_test_anom):
             m = compute_auc_metrics(y_test, s)
-            f = best_f1(y_test, s)
+            f = best_f1_label(y_test, s)
             per_model[n] = {**m, **f}
 
     # ensembles
     ensembles = {}
     # rank-average
     s_rank = rank_average(scores_test_list)
-    if use_gt_eval:
-        ensembles["rank_avg"] = eval_metrics_with_gt(s_rank, ds, args)
+    if scoring_mode == "train_eval":
+        ensembles["rank_avg"] = eval_metrics_train_eval(s_rank, ds, args)
     else:
-        ensembles["rank_avg"] = {**compute_auc_metrics(y_test, s_rank), **best_f1(y_test, s_rank)}
+        ensembles["rank_avg"] = {**compute_auc_metrics(y_test, -s_rank), **best_f1_label(y_test, -s_rank)}
 
     # z-mean
     s_z = zscore_mean(scores_test_list)
-    if use_gt_eval:
-        ensembles["z_mean"] = eval_metrics_with_gt(s_z, ds, args)
+    if scoring_mode == "train_eval":
+        ensembles["z_mean"] = eval_metrics_train_eval(s_z, ds, args)
     else:
-        ensembles["z_mean"] = {**compute_auc_metrics(y_test, s_z), **best_f1(y_test, s_z)}
+        ensembles["z_mean"] = {**compute_auc_metrics(y_test, -s_z), **best_f1_label(y_test, -s_z)}
 
     # max
     s_max = max_fusion(scores_test_list)
-    if use_gt_eval:
-        ensembles["max"] = eval_metrics_with_gt(s_max, ds, args)
+    if scoring_mode == "train_eval":
+        ensembles["max"] = eval_metrics_train_eval(s_max, ds, args)
     else:
-        ensembles["max"] = {**compute_auc_metrics(y_test, s_max), **best_f1(y_test, s_max)}
+        ensembles["max"] = {**compute_auc_metrics(y_test, -s_max), **best_f1_label(y_test, -s_max)}
 
     # optional: weight tuning on val
     tuned = None
-    if (not use_gt_eval) and val_idx is not None and len(args.checkpoints) == 3:
+    if scoring_mode != "train_eval" and val_idx is not None and len(args.checkpoints) == 3:
         y_val = y_true[np.array(val_idx, dtype=np.int64)]
-        scores_val_list = [scores_by_model[n][np.array(val_idx, dtype=np.int64)] for n in model_names]
+        scores_val_list = [-scores_by_model[n][np.array(val_idx, dtype=np.int64)] for n in model_names]
         best_w, best_val_metrics = grid_search_weights(
             y_val=y_val,
             scores_val_list=scores_val_list,
@@ -374,22 +394,23 @@ def main():
         )
         tuned = {"weights": dict(zip(model_names, best_w)), "val_metrics": best_val_metrics}
 
-        s_w = weighted_mean(scores_test_list, best_w)
-        ensembles["weighted_mean"] = {**compute_auc_metrics(y_test, s_w), **best_f1(y_test, s_w)}
+        s_w = weighted_mean([-s for s in scores_test_list], best_w)
+        ensembles["weighted_mean"] = {**compute_auc_metrics(y_test, s_w), **best_f1_label(y_test, s_w)}
     else:
         ensembles["weighted_mean"] = {"auc": float("nan"), "auprc": float("nan"), "f1": float("nan"), "thr": float("nan")}
 
+    val_ratio_used = 0.0 if scoring_mode == "train_eval" else float(args.val_ratio_for_weights)
     out = {
         "meta": {
-            "split": args.split,
+            "split": split,
             "num_samples": int(len(test_idx)),
-            "use_conf_score": bool(args.use_conf_score),
+            "scoring": scoring_mode,
+            "use_conf_score": bool(use_conf_score),
             "normal_label": int(args.normal_label),
-            "val_ratio_for_weights": float(args.val_ratio_for_weights),
+            "val_ratio_for_weights": val_ratio_used,
             "weight_grid_step": float(args.weight_grid_step),
             "checkpoints": args.checkpoints,
             "model_names": model_names,
-            "eval_mode": eval_mode,
         },
         "per_model": per_model,
         "ensembles": ensembles,

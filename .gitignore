@@ -202,3 +202,5 @@ data/ShanghaiTech/pose/
 data/UBnormal/pose/
 runs/*
 data/exp_dir/*
+outputs/*
+results/*

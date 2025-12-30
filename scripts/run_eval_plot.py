@@ -18,37 +18,6 @@ from utils.data_utils import trans_list
 from utils.scoring_utils import get_dataset_scores, score_auc, score_dataset
 from utils.unlearning_utils import eval_nll_on_indices, load_model_from_checkpoint
 
-REPORT_GUIDE = {
-    "A_setup": (
-        "Base checkpoint, 평가 대상 모델, df_splits.json 경로와 val split 출처를 요약. "
-        "tau_base는 val NLL의 tau_q 분위수이며 FPR은 mean(val_nll >= tau_base)로 계산."
-    ),
-    "B_selection_quality": (
-        "DF의 base 난이도 확인: cache_train['sB']로 DF별 base 평균 NLL을 기록하면 좋음. "
-        "DF1은 base NLL이 높게 나오는 것이 정상이며 DF2/DF3은 높지 않을 수도 있음."
-    ),
-    "C_intervention_effect": (
-        "delta_df = df_nll_mean - base_df_mean으로 DF 밀어내기 효과 확인. "
-        "타겟 DF에서 delta_df가 가장 크면 DF 정의와 업데이트 방향이 일치."
-    ),
-    "D_retain_quality": (
-        "val_nll_mean, val_fpr 변화로 정상 분포 보존성 평가. "
-        "val 분포가 함께 오른쪽으로 이동하면 부작용 가능."
-    ),
-    "E_utility": (
-        "test AUROC/AUPRC/F1으로 다운스트림 유틸리티 평가. "
-        "score 방향(클수록 이상/정상)은 scoring_utils 구현과 일치해야 함."
-    ),
-    "F_conclusion_template": (
-        "dfX_retrain에서 dfX의 delta_df가 최대이면 타겟팅 적합. "
-        "val 변화가 작으면 보존성 양호. "
-        "test 성능이 유지/개선되지 않으면 DF에 유용한 정상 다양성이 포함됐을 수 있음."
-    ),
-    "notes": (
-        "base_model을 로드하지만 base 수치는 cache의 sB로만 계산됨. "
-        "test 평가의 use_conf_score 정책이 cache와 일치하는지 확인 필요."
-    ),
-}
 
 def parse_args():
     parser = init_parser()
@@ -199,7 +168,6 @@ def main():
             "use_conf_score_val": bool(use_conf_score_val),
             "use_conf_score_test": bool(use_conf_score_test),
         },
-        "report_guide": REPORT_GUIDE,
         "base": {},
         "models": {},
     }
