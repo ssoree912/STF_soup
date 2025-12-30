@@ -1,6 +1,6 @@
 import math
 import random
-from typing import Iterable, List, Dict, Optional, Tuple
+from typing import Iterable, List, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -292,7 +292,11 @@ def select_df3_subdomain_train_df(
     k_clusters: int = 20,
     top_clusters: int = 2,
     tau_q: float = 0.999,
-) -> Tuple[List[int], Dict[str, object]]:
+    return_cluster_ctx: bool = False,
+) -> Union[
+    Tuple[List[int], Dict[str, object]],
+    Tuple[List[int], Dict[str, object], Optional[Dict[str, object]]],
+]:
     s_val = np.array([cache_val["sB"][sid] for sid in val_sids], dtype=np.float32)
     tau_base = float(np.quantile(s_val, tau_q))
 
@@ -303,7 +307,10 @@ def select_df3_subdomain_train_df(
             kept_tr.append(sid)
     Xtr = np.asarray(Xtr, dtype=np.float32)
     if Xtr.shape[0] == 0:
-        return [], {"tau_base": tau_base, "bad_clusters": [], "top_rates": []}
+        info = {"tau_base": tau_base, "bad_clusters": [], "top_rates": []}
+        if return_cluster_ctx:
+            return [], info, None
+        return [], info
 
     k = max(1, min(k_clusters, Xtr.shape[0]))
     from sklearn.cluster import KMeans
@@ -316,7 +323,10 @@ def select_df3_subdomain_train_df(
             kept_v.append(sid)
     Xv = np.asarray(Xv, dtype=np.float32)
     if Xv.shape[0] == 0:
-        return [], {"tau_base": tau_base, "bad_clusters": [], "top_rates": []}
+        info = {"tau_base": tau_base, "bad_clusters": [], "top_rates": []}
+        if return_cluster_ctx:
+            return [], info, None
+        return [], info
 
     val_labels = km.predict(Xv)
     clusters_val = {c: [] for c in range(k)}
@@ -351,6 +361,17 @@ def select_df3_subdomain_train_df(
         "val_cluster_sizes": {c: len(clusters_val[c]) for c in clusters_val},
         "train_cluster_sizes": {c: len(clusters_train[c]) for c in clusters_train},
     }
+    if return_cluster_ctx:
+        sid_to_cluster = {}
+        for c in bad_clusters:
+            for sid in clusters_train.get(c, []):
+                sid_to_cluster[int(sid)] = int(c)
+        cluster_ctx = {
+            "centers": km.cluster_centers_.astype(np.float32),
+            "sid_to_cluster": sid_to_cluster,
+            "bad_clusters": list(bad_clusters),
+        }
+        return df3_train, info, cluster_ctx
     return df3_train, info
 
 

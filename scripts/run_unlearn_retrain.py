@@ -1,4 +1,5 @@
 import argparse
+import math
 import json
 import os
 import pickle
@@ -15,6 +16,7 @@ import torch
 
 from args import init_parser, init_sub_args
 from dataset import get_dataset_and_loader
+from models.STG_NF.modules_pose import gaussian_likelihood, gaussian_p
 from utils.data_utils import trans_list
 from utils.unlearning_utils import (
     build_indexed_loader,
@@ -53,6 +55,18 @@ def parse_args():
     parser.add_argument("--k_df3", type=int, default=20)
     parser.add_argument("--top_clusters", type=int, default=2)
     parser.add_argument("--tau_q", type=float, default=0.999)
+    parser.add_argument(
+        "--df2_unlearn_loss",
+        type=str,
+        default="zsteps_delta",
+        choices=["nll", "zsteps_delta", "nll_var"],
+    )
+    parser.add_argument(
+        "--df3_unlearn_loss",
+        type=str,
+        default="emb_norm",
+        choices=["nll", "emb_norm", "cluster_dist"],
+    )
 
     # val selection for monitoring
     parser.add_argument("--val_ratio", type=float, default=0.2)
@@ -163,6 +177,82 @@ def sanity_check_dataset_indices(dataset_obj, sids, name="dataset"):
         return {"ok": False, "msg": f"{name}: index access FAILED: {repr(e)}"}
 
 
+def forward_nll_components(model, x, label):
+    z, logdet = model.flow(x, reverse=False)
+    mean, logs = model.prior(x, label)
+    objective = logdet + gaussian_likelihood(mean, logs, z)
+    denom = math.log(2.0) * x.size(1) * x.size(2) * x.size(3)
+    nll = (-objective) / denom
+    return z, logdet, mean, logs, nll, denom
+
+
+def compute_nll_steps(z, logdet, mean, logs, denom):
+    logp = gaussian_p(mean, logs, z)
+    logp_t = logp.sum(dim=(1, 3))
+    logdet_t = (logdet / z.size(2)).unsqueeze(1).expand_as(logp_t)
+    return -(logp_t + logdet_t) / denom
+
+
+def dynamics_metric_from_zsteps(z_steps, mode="normalized", eps=1e-6):
+    dz = z_steps[:, 1:] - z_steps[:, :-1]
+    dz_norm = torch.linalg.norm(dz, dim=-1)
+    if mode == "normalized":
+        dz_norm = dz_norm / max(1.0, math.sqrt(z_steps.size(-1)))
+    elif mode == "relative":
+        base = torch.linalg.norm(z_steps[:, :-1], dim=-1) + eps
+        dz_norm = dz_norm / base
+    return dz_norm.mean(dim=1)
+
+
+def compute_unlearn_score(
+    df_name,
+    z,
+    logdet,
+    mean,
+    logs,
+    nll,
+    denom,
+    batch_sids,
+    df3_ctx,
+    args,
+):
+    if df_name == "df1":
+        return nll, True
+
+    if df_name == "df2":
+        if args.df2_unlearn_loss == "nll":
+            return nll, True
+        if args.df2_unlearn_loss == "zsteps_delta":
+            z_steps = z.permute(0, 2, 1, 3).reshape(z.size(0), z.size(2), -1)
+            dynamics = dynamics_metric_from_zsteps(z_steps, mode=args.df2_mode, eps=args.df2_eps)
+            return -dynamics, False
+        if args.df2_unlearn_loss == "nll_var":
+            nll_steps = compute_nll_steps(z, logdet, mean, logs, denom)
+            return -nll_steps.var(dim=1, unbiased=False), False
+
+    if df_name == "df3":
+        if args.df3_unlearn_loss == "nll":
+            return nll, True
+        emb = z.mean(dim=2).reshape(z.size(0), -1)
+        if args.df3_unlearn_loss == "emb_norm":
+            return (emb ** 2).sum(dim=1), False
+        if args.df3_unlearn_loss == "cluster_dist":
+            if df3_ctx is None:
+                raise ValueError("df3_unlearn_loss=cluster_dist requires cluster centers.")
+            centers = df3_ctx["centers"]
+            sid_to_cluster = df3_ctx["sid_to_cluster"]
+            try:
+                cluster_idx = [sid_to_cluster[int(sid)] for sid in batch_sids]
+            except KeyError as exc:
+                raise KeyError(f"Missing df3 cluster label for sid={exc}.") from exc
+            idx = torch.tensor(cluster_idx, device=emb.device, dtype=torch.long)
+            center_batch = centers[idx]
+            dist2 = (emb - center_batch).pow(2).sum(dim=1)
+            return dist2, False
+
+    raise ValueError(f"Unsupported unlearn loss for df={df_name}")
+
+
 def main():
     args = parse_args()
     args, _ = init_sub_args(args)
@@ -210,6 +300,12 @@ def main():
     # ------------------------------------------------------------
     df_sets = {}
     df_info = {}
+    df3_cluster_ctx = None
+    df_unlearn_loss = {
+        "df1": "nll",
+        "df2": args.df2_unlearn_loss,
+        "df3": args.df3_unlearn_loss,
+    }
 
     if not args.skip_df1:
         df_sets["df1"] = select_df1_tail(cache_train["sB"], alpha=args.alpha_df1)
@@ -225,15 +321,27 @@ def main():
         )
 
     if not args.skip_df3:
-        df3, info = select_df3_subdomain_train_df(
-            cache_train,
-            normal_sids,
-            cache_val,
-            val_sids,
-            k_clusters=args.k_df3,
-            top_clusters=args.top_clusters,
-            tau_q=args.tau_q,
-        )
+        if args.df3_unlearn_loss == "cluster_dist":
+            df3, info, df3_cluster_ctx = select_df3_subdomain_train_df(
+                cache_train,
+                normal_sids,
+                cache_val,
+                val_sids,
+                k_clusters=args.k_df3,
+                top_clusters=args.top_clusters,
+                tau_q=args.tau_q,
+                return_cluster_ctx=True,
+            )
+        else:
+            df3, info = select_df3_subdomain_train_df(
+                cache_train,
+                normal_sids,
+                cache_val,
+                val_sids,
+                k_clusters=args.k_df3,
+                top_clusters=args.top_clusters,
+                tau_q=args.tau_q,
+            )
         df_sets["df3"] = df3
         df_info["df3"] = info
 
@@ -250,6 +358,7 @@ def main():
                 "tau_base": tau_base,
                 "fpr_base": fpr_base,
                 "df_info": df_info,
+                "df_unlearn_loss": df_unlearn_loss,
                 "overlap": overlap,
                 "cache_train_path": cache_path_train,
                 "cache_val_path": cache_path_val,
@@ -280,6 +389,7 @@ def main():
         "tau_base": tau_base,
         "fpr_base": fpr_base,
         "df_info": df_info,
+        "df_unlearn_loss": df_unlearn_loss,
         "overlap": overlap,
         "cache_train_path": cache_path_train,
         "cache_val_path": cache_path_val,
@@ -351,8 +461,14 @@ def main():
 
         model = load_model_from_checkpoint(args, dataset, args.checkpoint).to(device)
 
-        # ✅ GA 단계는 "DF 기준 스코어링"을 사용 (cache_train/meta와 일치)
+        # ✅ GA 단계는 DF 기준 스코어링을 사용 (NLL 기반일 때만 conf-score 적용)
         use_conf_score_unlearn = use_conf_score_df
+        df3_ctx = None
+        if df_name == "df3" and df3_cluster_ctx is not None:
+            df3_ctx = {
+                "centers": torch.tensor(df3_cluster_ctx["centers"], device=device),
+                "sid_to_cluster": df3_cluster_ctx["sid_to_cluster"],
+            }
 
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr_unlearn, weight_decay=0.0)
         model.train()
@@ -369,12 +485,24 @@ def main():
                 batch = next(it)
 
             x, score, label = prepare_batch(batch, device, args.model_confidence)
-            _, nll = model(x, label=label)
+            z, logdet, mean, logs, nll, denom = forward_nll_components(model, x, label)
+            batch_sids = batch[1].tolist() if torch.is_tensor(batch[1]) else list(batch[1])
+            unlearn_score, score_is_nll = compute_unlearn_score(
+                df_name,
+                z,
+                logdet,
+                mean,
+                logs,
+                nll,
+                denom,
+                batch_sids,
+                df3_ctx,
+                args,
+            )
+            if use_conf_score_unlearn and score_is_nll:
+                unlearn_score = unlearn_score * reduce_conf_score(score)
 
-            if use_conf_score_unlearn:
-                nll = nll * reduce_conf_score(score)
-
-            loss = -nll.mean()  # GA: DF에서 NLL 최대화
+            loss = -unlearn_score.mean()  # GA: DF 기준 스코어 최대화
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -486,6 +614,7 @@ def main():
             "df_size": len(df_sids),
             "dr_size": len(dr_sids),
             "steps_unlearn": steps_ran,
+            "unlearn_loss": df_unlearn_loss.get(df_name),
             "use_conf_score": {
                 "train": use_conf_score_train,
                 "df": use_conf_score_df,
