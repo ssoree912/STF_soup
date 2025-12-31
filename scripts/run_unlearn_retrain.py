@@ -129,17 +129,36 @@ def compute_basic_metrics(
     num_workers,
     use_conf_score_df,
     use_conf_score_val,
+    df_name=None,
+    df3_ctx=None,
+    args=None,
 ):
-    df_nll = eval_nll_on_indices(
-        model,
-        dataset_df,
-        df_sids,
-        device=device,
-        model_confidence=model_confidence,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        use_conf_score=use_conf_score_df,
-    )
+    if df_name in ("df2", "df3"):
+        df_nll, df_aux_mean = eval_nll_and_aux_on_indices(
+            model,
+            dataset_df,
+            df_sids,
+            device=device,
+            model_confidence=model_confidence,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            use_conf_score=use_conf_score_df,
+            df_name=df_name,
+            args=args,
+            df3_ctx=df3_ctx,
+        )
+    else:
+        df_nll = eval_nll_on_indices(
+            model,
+            dataset_df,
+            df_sids,
+            device=device,
+            model_confidence=model_confidence,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            use_conf_score=use_conf_score_df,
+        )
+        df_aux_mean = None
     val_nll = eval_nll_on_indices(
         model,
         dataset_val,
@@ -162,6 +181,20 @@ def compute_basic_metrics(
         "delta_val": float(val_nll.mean() - base_val) if val_nll.size else 0.0,
         "fpr_val": float(np.mean(val_nll >= tau_base)) if val_nll.size else 0.0,
     }
+    if df_name == "df2" and args is not None and args.df2_unlearn_loss != "nll":
+        base_aux = compute_df2_base_metric(cache_df, df_sids, args)
+        aux_mean = float(df_aux_mean) if df_aux_mean is not None else float("nan")
+        metrics["df2_metric_name"] = args.df2_unlearn_loss
+        metrics["df2_metric_base"] = float(base_aux)
+        metrics["df2_metric_mean"] = aux_mean
+        metrics["df2_metric_delta"] = aux_mean - base_aux
+    if df_name == "df3" and args is not None and args.df3_unlearn_loss != "nll":
+        base_aux = compute_df3_base_metric(cache_df, df_sids, args, df3_ctx)
+        aux_mean = float(df_aux_mean) if df_aux_mean is not None else float("nan")
+        metrics["df3_metric_name"] = args.df3_unlearn_loss
+        metrics["df3_metric_base"] = float(base_aux)
+        metrics["df3_metric_mean"] = aux_mean
+        metrics["df3_metric_delta"] = aux_mean - base_aux
     return metrics
 
 
@@ -253,6 +286,138 @@ def compute_unlearn_score(
     raise ValueError(f"Unsupported unlearn loss for df={df_name}")
 
 
+def dynamics_metric_from_zsteps_np(z_steps, mode="normalized", eps=1e-6):
+    dz = z_steps[1:] - z_steps[:-1]
+    dz_norm = np.linalg.norm(dz, axis=-1)
+    if mode == "normalized":
+        dz_norm = dz_norm / max(1.0, math.sqrt(z_steps.shape[-1]))
+    elif mode == "relative":
+        base = np.linalg.norm(z_steps[:-1], axis=-1) + eps
+        dz_norm = dz_norm / base
+    return float(dz_norm.mean())
+
+
+def compute_df2_base_metric(cache_df, df_sids, args):
+    if args.df2_unlearn_loss == "zsteps_delta":
+        z_cache = cache_df.get("z_steps", {})
+        vals = []
+        for sid in df_sids:
+            z_steps = z_cache.get(int(sid))
+            if z_steps is None:
+                continue
+            vals.append(dynamics_metric_from_zsteps_np(z_steps, mode=args.df2_mode, eps=args.df2_eps))
+        return float(np.mean(vals)) if vals else float("nan")
+    if args.df2_unlearn_loss == "nll_var":
+        nll_cache = cache_df.get("nll_steps", {})
+        vals = []
+        for sid in df_sids:
+            nll_steps = nll_cache.get(int(sid))
+            if nll_steps is None:
+                continue
+            vals.append(float(np.var(nll_steps)))
+        return float(np.mean(vals)) if vals else float("nan")
+    return float("nan")
+
+
+def compute_df3_base_metric(cache_df, df_sids, args, df3_ctx):
+    emb_cache = cache_df.get("emb", {})
+    if args.df3_unlearn_loss == "emb_norm":
+        vals = []
+        for sid in df_sids:
+            emb = emb_cache.get(int(sid))
+            if emb is None:
+                continue
+            vals.append(float(np.sum(emb ** 2)))
+        return float(np.mean(vals)) if vals else float("nan")
+    if args.df3_unlearn_loss == "cluster_dist":
+        if df3_ctx is None:
+            return float("nan")
+        centers = df3_ctx.get("centers")
+        sid_to_cluster = df3_ctx.get("sid_to_cluster", {})
+        vals = []
+        for sid in df_sids:
+            emb = emb_cache.get(int(sid))
+            cidx = sid_to_cluster.get(int(sid))
+            if emb is None or cidx is None:
+                continue
+            diff = emb - centers[int(cidx)]
+            vals.append(float(np.sum(diff ** 2)))
+        return float(np.mean(vals)) if vals else float("nan")
+    return float("nan")
+
+
+@torch.no_grad()
+def eval_nll_and_aux_on_indices(
+    model,
+    dataset,
+    indices,
+    device,
+    model_confidence,
+    batch_size,
+    num_workers,
+    use_conf_score,
+    df_name,
+    args,
+    df3_ctx,
+):
+    loader = build_indexed_loader(
+        dataset,
+        indices,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=False,
+    )
+    nll_list = []
+    aux_list = []
+    model.eval()
+
+    centers = None
+    sid_to_cluster = None
+    if df_name == "df3" and args.df3_unlearn_loss == "cluster_dist" and df3_ctx is not None:
+        centers = df3_ctx.get("centers")
+        if centers is not None and not torch.is_tensor(centers):
+            centers = torch.tensor(centers, device=device)
+        sid_to_cluster = df3_ctx.get("sid_to_cluster", {})
+
+    for batch in loader:
+        x, score, label = prepare_batch(batch, device, model_confidence)
+        z, logdet, mean, logs, nll, denom = forward_nll_components(model, x, label)
+        if use_conf_score:
+            nll = nll * reduce_conf_score(score)
+        nll_list.append(nll.detach().cpu())
+
+        aux_val = None
+        if df_name == "df2":
+            if args.df2_unlearn_loss == "zsteps_delta":
+                z_steps = z.permute(0, 2, 1, 3).reshape(z.size(0), z.size(2), -1)
+                aux_val = dynamics_metric_from_zsteps(z_steps, mode=args.df2_mode, eps=args.df2_eps)
+            elif args.df2_unlearn_loss == "nll_var":
+                nll_steps = compute_nll_steps(z, logdet, mean, logs, denom)
+                aux_val = nll_steps.var(dim=1, unbiased=False)
+        elif df_name == "df3":
+            emb = z.mean(dim=2).reshape(z.size(0), -1)
+            if args.df3_unlearn_loss == "emb_norm":
+                aux_val = (emb ** 2).sum(dim=1)
+            elif args.df3_unlearn_loss == "cluster_dist":
+                if centers is None or sid_to_cluster is None:
+                    raise ValueError("df3_unlearn_loss=cluster_dist requires cluster centers.")
+                sids = batch[1].tolist() if torch.is_tensor(batch[1]) else list(batch[1])
+                try:
+                    cluster_idx = [sid_to_cluster[int(sid)] for sid in sids]
+                except KeyError as exc:
+                    raise KeyError(f"Missing df3 cluster label for sid={exc}.") from exc
+                idx = torch.tensor(cluster_idx, device=emb.device, dtype=torch.long)
+                center_batch = centers[idx]
+                aux_val = (emb - center_batch).pow(2).sum(dim=1)
+
+        if aux_val is not None:
+            aux_list.append(aux_val.detach().cpu())
+
+    nll_arr = torch.cat(nll_list, dim=0).numpy() if nll_list else np.array([])
+    aux_mean = float(torch.cat(aux_list, dim=0).mean().item()) if aux_list else None
+    return nll_arr, aux_mean
+
+
 def main():
     args = parse_args()
     args, _ = init_sub_args(args)
@@ -300,7 +465,7 @@ def main():
     # ------------------------------------------------------------
     df_sets = {}
     df_info = {}
-    df3_cluster_ctx = None
+    df3_cluster_ctx_np = None
     df_unlearn_loss = {
         "df1": "nll",
         "df2": args.df2_unlearn_loss,
@@ -322,7 +487,7 @@ def main():
 
     if not args.skip_df3:
         if args.df3_unlearn_loss == "cluster_dist":
-            df3, info, df3_cluster_ctx = select_df3_subdomain_train_df(
+            df3, info, df3_cluster_ctx_np = select_df3_subdomain_train_df(
                 cache_train,
                 normal_sids,
                 cache_val,
@@ -432,6 +597,32 @@ def main():
     # ------------------------------------------------------------
     # 5) For each DF: unlearn (GA) -> retrain (GD)
     # ------------------------------------------------------------
+    def eval_all_df_metrics(model):
+        out = {}
+        for name, sids in df_sets.items():
+            if not sids:
+                continue
+            ctx = df3_cluster_ctx_np if name == "df3" else None
+            out[name] = compute_basic_metrics(
+                model,
+                train_dataset,
+                sids,
+                val_dataset,
+                val_sids,
+                cache_train,
+                cache_val,
+                tau_base,
+                device,
+                args.model_confidence,
+                args.batch_size_retrain,
+                args.num_workers,
+                use_conf_score_df,
+                use_conf_score_val,
+                df_name=name,
+                df3_ctx=ctx,
+                args=args,
+            )
+        return out
     for df_name, df_sids in df_sets.items():
         if not df_sids:
             continue
@@ -463,11 +654,11 @@ def main():
 
         # ✅ GA 단계는 DF 기준 스코어링을 사용 (NLL 기반일 때만 conf-score 적용)
         use_conf_score_unlearn = use_conf_score_df
-        df3_ctx = None
-        if df_name == "df3" and df3_cluster_ctx is not None:
-            df3_ctx = {
-                "centers": torch.tensor(df3_cluster_ctx["centers"], device=device),
-                "sid_to_cluster": df3_cluster_ctx["sid_to_cluster"],
+        df3_ctx_torch = None
+        if df_name == "df3" and df3_cluster_ctx_np is not None:
+            df3_ctx_torch = {
+                "centers": torch.tensor(df3_cluster_ctx_np["centers"], device=device),
+                "sid_to_cluster": df3_cluster_ctx_np["sid_to_cluster"],
             }
 
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr_unlearn, weight_decay=0.0)
@@ -496,7 +687,7 @@ def main():
                 nll,
                 denom,
                 batch_sids,
-                df3_ctx,
+                df3_ctx_torch,
                 args,
             )
             if use_conf_score_unlearn and score_is_nll:
@@ -543,7 +734,11 @@ def main():
             args.num_workers,
             use_conf_score_df,
             use_conf_score_val,
+            df_name=df_name,
+            df3_ctx=df3_cluster_ctx_np,
+            args=args,
         )
+        unlearn_df_metrics_all = eval_all_df_metrics(model)
         model.train()
 
         unlearn_ckpt = os.path.join(args.output_dir, f"{df_name}_unlearn.pth.tar")
@@ -585,6 +780,9 @@ def main():
                 args.num_workers,
                 use_conf_score_df,
                 use_conf_score_val,
+                df_name=df_name,
+                df3_ctx=df3_cluster_ctx_np,
+                args=args,
             )
             model.train()
             epoch_metrics["epoch"] = epoch + 1
@@ -605,7 +803,11 @@ def main():
             args.num_workers,
             use_conf_score_df,
             use_conf_score_val,
+            df_name=df_name,
+            df3_ctx=df3_cluster_ctx_np,
+            args=args,
         )
+        retrain_df_metrics_all = eval_all_df_metrics(model)
 
         retrain_ckpt = os.path.join(args.output_dir, f"{df_name}_retrain.pth.tar")
         torch.save({"state_dict": model.state_dict(), "stage": "retrain"}, retrain_ckpt)
@@ -623,9 +825,11 @@ def main():
                 "retrain": use_conf_score_retrain,
             },
             "unlearn_metrics": unlearn_metrics,
+            "unlearn_df_metrics_all": unlearn_df_metrics_all,
             "unlearn_eval_history": eval_history,
             "retrain_metrics": retrain_metrics,
             "retrain_history": retrain_history,
+            "retrain_df_metrics_all": retrain_df_metrics_all,
             "unlearn_ckpt": unlearn_ckpt,
             "retrain_ckpt": retrain_ckpt,
         }
