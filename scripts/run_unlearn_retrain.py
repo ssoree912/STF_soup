@@ -81,6 +81,14 @@ def parse_args():
     parser.add_argument("--steps_unlearn", type=int, default=800)
     parser.add_argument("--lr_retrain", type=float, default=5e-5)
     parser.add_argument("--epochs_retrain", type=int, default=2)
+    parser.add_argument("--retrain_min_epochs", type=int, default=1,
+                        help="최소 retrain epoch 보장")
+    parser.add_argument("--retrain_stop_on_aux_restore", action="store_true",
+                        help="DF aux 변화가 0으로 복귀하면 retrain early-stop")
+    parser.add_argument("--aux_retain_ratio", type=float, default=0.3,
+                        help="|aux_delta| <= ratio * |aux_delta_target| 이면 stop (기본 0.3)")
+    parser.add_argument("--aux_retain_min", type=float, default=0.0,
+                        help="절대 임계값 하한. ratio가 너무 작아지는 경우 대비")
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
     # safety / early stop
@@ -738,6 +746,20 @@ def main():
             df3_ctx=df3_cluster_ctx_np,
             args=args,
         )
+        # ---- retrain early-stop을 위한 aux target 저장 ----
+        aux_key = None
+        aux_target = None
+
+        if df_name == "df2" and args.df2_unlearn_loss != "nll":
+            aux_key = "df2_metric_delta"
+            aux_target = unlearn_metrics.get(aux_key, None)
+        elif df_name == "df3" and args.df3_unlearn_loss != "nll":
+            aux_key = "df3_metric_delta"
+            aux_target = unlearn_metrics.get(aux_key, None)
+
+        # NaN/None 방어
+        if aux_target is None or (isinstance(aux_target, float) and np.isnan(aux_target)):
+            aux_key, aux_target = None, None
         unlearn_df_metrics_all = eval_all_df_metrics(model)
         model.train()
 
@@ -787,6 +809,47 @@ def main():
             model.train()
             epoch_metrics["epoch"] = epoch + 1
             retrain_history.append(epoch_metrics)
+
+            # ---- retrain early-stop: val 안정 + aux 변화 유지 ----
+            stop_reason = None
+
+            # (A) val 안정성: FPR 폭주하면 stop
+            if epoch_metrics.get("fpr_val", 0.0) > args.fpr_tol * fpr_base:
+                stop_reason = (
+                    f"val FPR exploded: {epoch_metrics['fpr_val']:.6f} > "
+                    f"{args.fpr_tol}*{fpr_base:.6f}"
+                )
+
+            # (B) aux 변화가 0으로 되돌아오면 stop (DF2/DF3만)
+            if (
+                stop_reason is None
+                and args.retrain_stop_on_aux_restore
+                and aux_key is not None
+                and aux_target is not None
+            ):
+                cur = epoch_metrics.get(aux_key, None)
+
+                if cur is not None and not (isinstance(cur, float) and np.isnan(cur)):
+                    # 임계값: ratio 기반 + 절대 하한
+                    thr = max(
+                        float(args.aux_retain_min),
+                        float(args.aux_retain_ratio) * abs(float(aux_target)),
+                    )
+
+                    # 1) 변화가 대부분 복구됨(0에 가까움)
+                    if abs(float(cur)) <= thr:
+                        stop_reason = (
+                            f"{aux_key} restored: |{cur:.6g}| <= {thr:.6g} "
+                            f"(target={aux_target:.6g})"
+                        )
+                    # 2) sign flip (완전히 반대로 복구)
+                    elif float(cur) * float(aux_target) <= 0.0:
+                        stop_reason = f"{aux_key} sign-flip: cur={cur:.6g}, target={aux_target:.6g}"
+
+            if stop_reason is not None and (epoch + 1) >= args.retrain_min_epochs:
+                retrain_history[-1]["early_stop_reason"] = stop_reason
+                retrain_history[-1]["early_stop_epoch"] = epoch + 1
+                break
 
         retrain_metrics = compute_basic_metrics(
             model,
