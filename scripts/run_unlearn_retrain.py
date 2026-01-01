@@ -370,6 +370,10 @@ def parse_args():
     parser.add_argument("--epochs_retrain", type=int, default=2)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
+    # DF dump
+    parser.add_argument("--dump_df_sids", action="store_true")
+    parser.add_argument("--dump_df_format", type=str, default="pkl", choices=["pkl", "txt"])
+
     # safety
     parser.add_argument("--eval_every", type=int, default=200)
     parser.add_argument("--fpr_tol", type=float, default=2.0)
@@ -527,6 +531,17 @@ def main():
             raise ValueError(f"{args.df_name} selected empty set. df_info={df_info}")
     else:
         raise ValueError("For now, run mix with your dedicated mix script later. (mode=single recommended)")
+
+    if args.dump_df_sids:
+        dump_path = os.path.join(args.output_dir, f"{args.df_name}_sids.{args.dump_df_format}")
+        if args.dump_df_format == "pkl":
+            with open(dump_path, "wb") as f:
+                pickle.dump(df_sids, f)
+        else:
+            with open(dump_path, "w") as f:
+                for sid in df_sids:
+                    f.write(f"{int(sid)}\n")
+        print(f"[INFO] DF sids saved: {dump_path}")
 
     # 5) DR set
     df_set = set(df_sids)

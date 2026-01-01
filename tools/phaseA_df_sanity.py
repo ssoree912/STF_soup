@@ -127,6 +127,18 @@ def parse_args():
         default="df1,df2p,df3p",
         help="comma-separated: df1,df2,df2p,df3,df3p",
     )
+    p.add_argument(
+        "--df_paths",
+        nargs="+",
+        default=None,
+        help="paths to pkl/txt with DF sids; if set, load these instead of selecting",
+    )
+    p.add_argument(
+        "--df_names",
+        type=str,
+        default=None,
+        help="comma-separated names for --df_paths (optional, default: filename stem)",
+    )
 
     p.add_argument("--alpha_df1", type=float, default=0.01)
 
@@ -209,119 +221,144 @@ def main():
 
     device = torch.device(args.device)
 
-    df_list = [x.strip() for x in args.df_list.split(",") if x.strip()]
-    need_model = ("df3p" in df_list)
-    model = None
-    if need_model:
-        if args.checkpoint is None:
-            raise ValueError("df3p requires --checkpoint")
-        model = load_model_from_checkpoint(args, dataset, args.checkpoint).to(device)
-
     df_sets: Dict[str, List[int]] = {}
     df_infos: Dict[str, Dict] = {}
     warnings = []
 
-    for name in df_list:
-        if name == "df1":
-            df = sorted(list(select_df1_tail(cache_train["sB"], alpha=args.alpha_df1)))
-            info = {"alpha_df1": float(args.alpha_df1)}
-        elif name == "df2":
-            df = sorted(list(select_df2_dynamics_v2(
-                cache_train,
-                alpha_g=args.alpha_df2,
-                mode=args.df2_mode,
-                robust=bool(args.df2_robust),
-                trim_ratio=float(args.df2_trim_ratio),
-                eps=float(args.df2_eps),
-            )))
-            info = {
-                "alpha_df2": float(args.alpha_df2),
-                "df2_mode": args.df2_mode,
-                "df2_robust": bool(args.df2_robust),
-                "df2_trim_ratio": float(args.df2_trim_ratio),
-                "df2_eps": float(args.df2_eps),
-            }
-        elif name == "df2p":
-            budget_max = None if args.df2p_budget_max <= 0 else int(args.df2p_budget_max)
-            df, info = select_df2_val_fp_train_df(
-                cache_train=cache_train,
-                train_sids=normal_sids,
-                cache_val=cache_val,
-                val_sids=val_sids,
-                val_dataset=val_dataset,
-                tau_base=tau_base,
-                normal_label=int(args.normal_label),
-                knn_k=int(args.df2p_knn_k),
-                budget_alpha=float(args.df2p_budget_alpha),
-                budget_max=budget_max,
-                seed=int(args.val_seed),
-            )
-            df = sorted(list(set(df)))
-            fp_n = int(info.get("num_fp_val", 0))
-            knn_k = int(info.get("knn_k", 0))
-            budget = int(info.get("budget", 0))
-            fp_pool = fp_n * knn_k
-            if fp_pool <= 0:
-                warnings.append("df2p: fp_pool is empty (num_fp_val * knn_k == 0).")
-            elif budget > fp_pool:
-                warnings.append(
-                    f"df2p: budget({budget}) > fp_pool({fp_pool}). "
-                    "Reduce budget_alpha or increase knn_k."
-                )
-            elif fp_pool > 0 and budget >= int(0.5 * fp_pool):
-                warnings.append(
-                    f"df2p: budget({budget}) is close to fp_pool({fp_pool}); "
-                    "DF may be overly saturated."
-                )
-        elif name == "df3":
-            df, info = select_df3_subdomain_train_df(
-                cache_train, normal_sids, cache_val, val_sids,
-                k_clusters=int(args.k_df3),
-                top_clusters=int(args.top_clusters),
-                tau_q=float(args.tau_q),
-                return_cluster_ctx=False,
-            )
-            df = sorted(list(set(df)))
-        elif name == "df3p":
-            ex = args.df3p_exclude_regex.strip() or None
-            df, info = select_df3_grad_alignment_train_df(
-                base_model=model,
-                train_dataset=train_dataset,
-                train_sids=normal_sids,
-                val_dataset=val_dataset,
-                val_sids=val_sids,
-                device=device,
-                model_confidence=bool(args.model_confidence),
-                use_conf_score_val=bool(args.model_confidence),
-                use_conf_score_train=bool(args.model_confidence),
-                normal_label=int(args.normal_label),
-                alpha=float(args.df3p_alpha),
-                sample_train=int(args.df3p_sample_train),
-                sample_val=int(args.df3p_sample_val),
-                seed=int(args.val_seed),
-                batch_size=1,
-                num_workers=int(args.num_workers),
-                include_regex=str(args.df3p_include_regex),
-                exclude_regex=ex,
-                max_val_batches=int(args.df3p_max_val_batches),
-            )
-            df = sorted(list(set(df)))
+    df_list = [x.strip() for x in args.df_list.split(",") if x.strip()]
+    if args.df_paths:
+        paths = args.df_paths
+        if len(paths) == 1 and "," in paths[0]:
+            paths = [p.strip() for p in paths[0].split(",") if p.strip()]
+        if args.df_names:
+            names = [n.strip() for n in args.df_names.split(",") if n.strip()]
         else:
-            raise ValueError(f"Unknown df name: {name}")
+            names = [os.path.splitext(os.path.basename(p))[0] for p in paths]
+        if len(names) != len(paths):
+            raise ValueError("--df_names length must match --df_paths length.")
 
-        df_sets[name] = df
-        df_infos[name] = info
-
-        if args.dump_sids:
-            if args.dump_format == "pkl":
-                outp = os.path.join(args.output_dir, f"{name}_sids.pkl")
-                with open(outp, "wb") as f:
-                    pickle.dump(df, f)
+        df_list = list(names)
+        for name, path in zip(names, paths):
+            if path.endswith(".pkl"):
+                with open(path, "rb") as f:
+                    df = pickle.load(f)
+            elif path.endswith(".txt"):
+                with open(path, "r") as f:
+                    df = [int(line.strip()) for line in f if line.strip()]
             else:
-                outp = os.path.join(args.output_dir, f"{name}_sids.txt")
-                with open(outp, "w") as f:
-                    for sid in df:
-                        f.write(f"{int(sid)}\n")
+                raise ValueError(f"Unsupported DF file: {path}")
+            df = sorted(list(set(map(int, df))))
+            df_sets[name] = df
+            df_infos[name] = {"source": path}
+    else:
+        need_model = ("df3p" in df_list)
+        model = None
+        if need_model:
+            if args.checkpoint is None:
+                raise ValueError("df3p requires --checkpoint")
+            model = load_model_from_checkpoint(args, dataset, args.checkpoint).to(device)
+
+        for name in df_list:
+            if name == "df1":
+                df = sorted(list(select_df1_tail(cache_train["sB"], alpha=args.alpha_df1)))
+                info = {"alpha_df1": float(args.alpha_df1)}
+            elif name == "df2":
+                df = sorted(list(select_df2_dynamics_v2(
+                    cache_train,
+                    alpha_g=args.alpha_df2,
+                    mode=args.df2_mode,
+                    robust=bool(args.df2_robust),
+                    trim_ratio=float(args.df2_trim_ratio),
+                    eps=float(args.df2_eps),
+                )))
+                info = {
+                    "alpha_df2": float(args.alpha_df2),
+                    "df2_mode": args.df2_mode,
+                    "df2_robust": bool(args.df2_robust),
+                    "df2_trim_ratio": float(args.df2_trim_ratio),
+                    "df2_eps": float(args.df2_eps),
+                }
+            elif name == "df2p":
+                budget_max = None if args.df2p_budget_max <= 0 else int(args.df2p_budget_max)
+                df, info = select_df2_val_fp_train_df(
+                    cache_train=cache_train,
+                    train_sids=normal_sids,
+                    cache_val=cache_val,
+                    val_sids=val_sids,
+                    val_dataset=val_dataset,
+                    tau_base=tau_base,
+                    normal_label=int(args.normal_label),
+                    knn_k=int(args.df2p_knn_k),
+                    budget_alpha=float(args.df2p_budget_alpha),
+                    budget_max=budget_max,
+                    seed=int(args.val_seed),
+                )
+                df = sorted(list(set(df)))
+                fp_n = int(info.get("num_fp_val", 0))
+                knn_k = int(info.get("knn_k", 0))
+                budget = int(info.get("budget", 0))
+                fp_pool = fp_n * knn_k
+                if fp_pool <= 0:
+                    warnings.append("df2p: fp_pool is empty (num_fp_val * knn_k == 0).")
+                elif budget > fp_pool:
+                    warnings.append(
+                        f"df2p: budget({budget}) > fp_pool({fp_pool}). "
+                        "Reduce budget_alpha or increase knn_k."
+                    )
+                elif fp_pool > 0 and budget >= int(0.5 * fp_pool):
+                    warnings.append(
+                        f"df2p: budget({budget}) is close to fp_pool({fp_pool}); "
+                        "DF may be overly saturated."
+                    )
+            elif name == "df3":
+                df, info = select_df3_subdomain_train_df(
+                    cache_train, normal_sids, cache_val, val_sids,
+                    k_clusters=int(args.k_df3),
+                    top_clusters=int(args.top_clusters),
+                    tau_q=float(args.tau_q),
+                    return_cluster_ctx=False,
+                )
+                df = sorted(list(set(df)))
+            elif name == "df3p":
+                ex = args.df3p_exclude_regex.strip() or None
+                df, info = select_df3_grad_alignment_train_df(
+                    base_model=model,
+                    train_dataset=train_dataset,
+                    train_sids=normal_sids,
+                    val_dataset=val_dataset,
+                    val_sids=val_sids,
+                    device=device,
+                    model_confidence=bool(args.model_confidence),
+                    use_conf_score_val=bool(args.model_confidence),
+                    use_conf_score_train=bool(args.model_confidence),
+                    normal_label=int(args.normal_label),
+                    alpha=float(args.df3p_alpha),
+                    sample_train=int(args.df3p_sample_train),
+                    sample_val=int(args.df3p_sample_val),
+                    seed=int(args.val_seed),
+                    batch_size=1,
+                    num_workers=int(args.num_workers),
+                    include_regex=str(args.df3p_include_regex),
+                    exclude_regex=ex,
+                    max_val_batches=int(args.df3p_max_val_batches),
+                )
+                df = sorted(list(set(df)))
+            else:
+                raise ValueError(f"Unknown df name: {name}")
+
+            df_sets[name] = df
+            df_infos[name] = info
+
+            if args.dump_sids:
+                if args.dump_format == "pkl":
+                    outp = os.path.join(args.output_dir, f"{name}_sids.pkl")
+                    with open(outp, "wb") as f:
+                        pickle.dump(df, f)
+                else:
+                    outp = os.path.join(args.output_dir, f"{name}_sids.txt")
+                    with open(outp, "w") as f:
+                        for sid in df:
+                            f.write(f"{int(sid)}\n")
 
     per_df_stats = {}
     for name, sids in df_sets.items():
