@@ -12,7 +12,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from args import init_sub_args
+from typing import Optional
+
+from args import init_parser, init_sub_args
 from dataset import get_dataset_and_loader
 from utils.data_utils import trans_list
 from utils.unlearning_utils import load_model_from_checkpoint, prepare_batch, reduce_conf_score
@@ -24,7 +26,7 @@ def _load_reference_args(path: Path) -> argparse.Namespace:
     return argparse.Namespace(**payload)
 
 
-def _load_args_from_checkpoint(path: Path) -> argparse.Namespace:
+def _load_args_from_checkpoint(path: Path) -> Optional[argparse.Namespace]:
     ckpt = torch.load(path, map_location="cpu")
     if isinstance(ckpt, dict) and "args" in ckpt:
         ckpt_args = ckpt["args"]
@@ -32,10 +34,16 @@ def _load_args_from_checkpoint(path: Path) -> argparse.Namespace:
             return ckpt_args
         if isinstance(ckpt_args, dict):
             return argparse.Namespace(**ckpt_args)
-    raise ValueError(
-        f"Checkpoint missing args: {path}. "
-        "Provide --reference_args or a checkpoint saved with args."
-    )
+    return None
+
+
+def _merge_with_defaults(loaded_args: Optional[argparse.Namespace]) -> argparse.Namespace:
+    base_args = init_parser().parse_args([])
+    if loaded_args is None:
+        return base_args
+    for k, v in vars(loaded_args).items():
+        setattr(base_args, k, v)
+    return base_args
 
 
 def _build_loader(ref_args: argparse.Namespace, batch_size: int, num_workers: int):
@@ -179,6 +187,8 @@ def main():
     ap.add_argument("--checkpoints", nargs="+", required=True)
     ap.add_argument("--output_dir", type=Path, required=True)
     ap.add_argument("--device", type=str, default=None)
+    ap.add_argument("--dataset", type=str, default=None)
+    ap.add_argument("--data_dir", type=str, default=None)
     ap.add_argument("--fisher_max_batches", type=int, default=200)
     ap.add_argument("--fisher_batch_size", type=int, default=None)
     ap.add_argument("--num_workers", type=int, default=None)
@@ -192,12 +202,25 @@ def main():
 
     if args.reference_args is None and args.reference_ckpt is None:
         raise ValueError("Provide --reference_args or --reference_ckpt")
+    loaded_args = None
+    reference_source = None
     if args.reference_args is not None:
-        ref_args = _load_reference_args(args.reference_args)
+        loaded_args = _load_reference_args(args.reference_args)
         reference_source = str(args.reference_args)
-    else:
-        ref_args = _load_args_from_checkpoint(args.reference_ckpt)
+    elif args.reference_ckpt is not None:
+        loaded_args = _load_args_from_checkpoint(args.reference_ckpt)
         reference_source = str(args.reference_ckpt)
+        if loaded_args is None:
+            print(f"[WARN] checkpoint has no args: {args.reference_ckpt}. Using defaults.")
+    ref_args = _merge_with_defaults(loaded_args)
+    if getattr(loaded_args, "dataset", None) is None and args.dataset is None:
+        print(f"[WARN] dataset missing; using default dataset={ref_args.dataset}")
+    if getattr(loaded_args, "data_dir", None) is None and args.data_dir is None:
+        print(f"[WARN] data_dir missing; using default data_dir={ref_args.data_dir}")
+    if args.dataset is not None:
+        ref_args.dataset = args.dataset
+    if args.data_dir is not None:
+        ref_args.data_dir = args.data_dir
     if args.device:
         ref_args.device = args.device
     device = torch.device(ref_args.device)

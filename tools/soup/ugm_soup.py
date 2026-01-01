@@ -11,7 +11,7 @@ import pickle
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from args import init_sub_args
+from args import init_parser, init_sub_args
 from dataset import get_dataset_and_loader
 from models.STG_NF.model_pose import STG_NF
 from utils.data_utils import trans_list
@@ -50,6 +50,26 @@ def _load_reference_args(path: Path) -> argparse.Namespace:
     with open(path, "r") as f:
         payload = json.load(f)
     return argparse.Namespace(**payload)
+
+
+def _load_args_from_checkpoint(path: Path) -> Optional[argparse.Namespace]:
+    ckpt = torch.load(path, map_location="cpu")
+    if isinstance(ckpt, dict) and "args" in ckpt:
+        ckpt_args = ckpt["args"]
+        if isinstance(ckpt_args, argparse.Namespace):
+            return ckpt_args
+        if isinstance(ckpt_args, dict):
+            return argparse.Namespace(**ckpt_args)
+    return None
+
+
+def _merge_with_defaults(loaded_args: Optional[argparse.Namespace]) -> argparse.Namespace:
+    base_args = init_parser().parse_args([])
+    if loaded_args is None:
+        return base_args
+    for k, v in vars(loaded_args).items():
+        setattr(base_args, k, v)
+    return base_args
 
 
 def _normalize_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -264,7 +284,11 @@ def eval_df1_delta_df(
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--reference_args", type=Path, required=True)
+    ap.add_argument("--reference_args", type=Path, default=None)
+    ap.add_argument("--reference_ckpt", type=Path, default=None,
+                    help="checkpoint path that contains args (state['args'])")
+    ap.add_argument("--dataset", type=str, default=None)
+    ap.add_argument("--data_dir", type=str, default=None)
     ap.add_argument("--cache_train_path", type=Path, required=True)
     ap.add_argument("--alpha_df1", type=float, default=0.01)
 
@@ -302,7 +326,22 @@ def main():
     if len(args.checkpoints) != len(args.fishers):
         raise ValueError("checkpoints and fishers must align 1:1")
 
-    ref_args = _load_reference_args(args.reference_args)
+    if args.reference_args is None and args.reference_ckpt is None:
+        raise ValueError("Provide --reference_args or --reference_ckpt")
+
+    loaded_args = None
+    if args.reference_args is not None:
+        loaded_args = _load_reference_args(args.reference_args)
+    elif args.reference_ckpt is not None:
+        loaded_args = _load_args_from_checkpoint(args.reference_ckpt)
+        if loaded_args is None:
+            logger.warning("checkpoint has no args: %s. Using defaults.", args.reference_ckpt)
+
+    ref_args = _merge_with_defaults(loaded_args)
+    if args.dataset is not None:
+        ref_args.dataset = args.dataset
+    if args.data_dir is not None:
+        ref_args.data_dir = args.data_dir
     if args.device:
         ref_args.device = args.device
     ref_args, model_args = init_sub_args(ref_args)
@@ -384,6 +423,7 @@ def main():
     best = None
     best_state = None
     best_alphas = None
+    best_metrics = None
     logs = []
 
     for combo in itertools.product(grid_values, repeat=k_models):
@@ -462,6 +502,7 @@ def main():
             best = score
             best_state = merged
             best_alphas = alphas
+            best_metrics = metrics
             logger.info("New best %s=%.4f with alphas=%s", key, score, best_alphas)
         del model
         if device.type == "cuda":
@@ -476,13 +517,21 @@ def main():
             json.dump({"best": None, "logs": logs, "df1_min_delta": args.df1_min_delta}, f, indent=2)
         return
 
-    torch.save(best_state, args.output)
+    if best_metrics is None:
+        for row in logs:
+            if row["alphas"] == best_alphas:
+                best_metrics = row["metrics"]
+                break
 
-    best_metrics = None
-    for row in logs:
-        if row["alphas"] == best_alphas:
-            best_metrics = row["metrics"]
-            break
+    ckpt_payload = {
+        "state_dict": best_state,
+        "metrics": best_metrics,
+        "best_alphas": best_alphas,
+        "select_by": args.select_by,
+        "df1_min_delta": args.df1_min_delta,
+        "f1_threshold": args.f1_threshold,
+    }
+    torch.save(ckpt_payload, args.output)
 
     payload = {
         "soup_path": str(args.output),
@@ -491,6 +540,7 @@ def main():
         "df1_min_delta": args.df1_min_delta,
         "f1_threshold": args.f1_threshold,
         "best_metrics": best_metrics,
+        "best_roc_auc": None if best_metrics is None else best_metrics.get("roc_auc"),
         "logs": logs,
         "fisher_meta": fisher_metas,
         "checkpoints": args.checkpoints,
