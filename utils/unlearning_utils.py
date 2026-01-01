@@ -1,5 +1,7 @@
 import math
 import random
+import re
+from collections import defaultdict
 from typing import Iterable, List, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -373,6 +375,296 @@ def select_df3_subdomain_train_df(
         }
         return df3_train, info, cluster_ctx
     return df3_train, info
+
+
+def _get_labels_map(dataset: Dataset, sids: List[int]) -> Dict[int, int]:
+    out: Dict[int, int] = {}
+    if hasattr(dataset, "labels"):
+        labels = dataset.labels
+        for sid in sids:
+            out[int(sid)] = int(labels[int(sid)])
+        return out
+
+    for sid in sids:
+        item = dataset[int(sid)]
+        label = item[-1]
+        if torch.is_tensor(label):
+            label = int(label.item())
+        out[int(sid)] = int(label)
+    return out
+
+
+def select_df2_val_fp_train_df(
+    cache_train: Dict[str, Dict[int, np.ndarray]],
+    train_sids: List[int],
+    cache_val: Dict[str, Dict[int, np.ndarray]],
+    val_sids: List[int],
+    val_dataset: Dataset,
+    tau_base: float,
+    normal_label: int = 1,
+    knn_k: int = 20,
+    budget_alpha: float = 0.02,
+    budget_max: Optional[int] = None,
+    seed: int = 0,
+) -> Tuple[List[int], Dict[str, object]]:
+    val_label_map = _get_labels_map(val_dataset, val_sids)
+
+    fp_val = []
+    for sid in val_sids:
+        sid = int(sid)
+        if val_label_map.get(sid, None) != int(normal_label):
+            continue
+        sb = cache_val.get("sB", {}).get(sid)
+        if sb is None:
+            continue
+        if float(sb) >= float(tau_base):
+            fp_val.append(sid)
+
+    budget = max(1, int(len(train_sids) * float(budget_alpha)))
+    if budget_max is not None:
+        budget = min(budget, int(budget_max))
+
+    tr_ids, tr_X = [], []
+    emb_train = cache_train.get("emb", {})
+    for sid in train_sids:
+        sid = int(sid)
+        emb = emb_train.get(sid, None)
+        if emb is None:
+            continue
+        tr_ids.append(sid)
+        tr_X.append(emb)
+    tr_X = np.asarray(tr_X, dtype=np.float32)
+
+    if tr_X.shape[0] == 0 or len(fp_val) == 0:
+        info = {
+            "tau_base": float(tau_base),
+            "num_fp_val": int(len(fp_val)),
+            "train_emb_n": int(tr_X.shape[0]),
+            "budget": int(budget),
+            "note": "empty fp_val or empty embeddings",
+        }
+        return [], info
+
+    fp_ids, fp_X = [], []
+    emb_val = cache_val.get("emb", {})
+    for sid in fp_val:
+        emb = emb_val.get(int(sid), None)
+        if emb is None:
+            continue
+        fp_ids.append(int(sid))
+        fp_X.append(emb)
+    fp_X = np.asarray(fp_X, dtype=np.float32)
+    if fp_X.shape[0] == 0:
+        info = {
+            "tau_base": float(tau_base),
+            "num_fp_val": int(len(fp_val)),
+            "train_emb_n": int(tr_X.shape[0]),
+            "budget": int(budget),
+            "note": "fp embeddings missing",
+        }
+        return [], info
+
+    from sklearn.neighbors import NearestNeighbors
+    knn_k = max(1, min(int(knn_k), tr_X.shape[0]))
+    nn = NearestNeighbors(n_neighbors=knn_k, metric="euclidean")
+    nn.fit(tr_X)
+    dists, idxs = nn.kneighbors(fp_X, return_distance=True)
+
+    freq = defaultdict(int)
+    dist_sum = defaultdict(float)
+    for q in range(idxs.shape[0]):
+        for j in range(idxs.shape[1]):
+            tr_sid = tr_ids[int(idxs[q, j])]
+            freq[tr_sid] += 1
+            dist_sum[tr_sid] += float(dists[q, j])
+
+    items = []
+    for sid, cnt in freq.items():
+        items.append((sid, cnt, dist_sum[sid] / max(1, cnt)))
+    items.sort(key=lambda x: (-x[1], x[2]))
+
+    df2 = [sid for sid, _, _ in items[:budget]]
+    info = {
+        "tau_base": float(tau_base),
+        "num_fp_val": int(len(fp_ids)),
+        "train_emb_n": int(tr_X.shape[0]),
+        "knn_k": int(knn_k),
+        "budget_alpha": float(budget_alpha),
+        "budget": int(budget),
+        "top5": items[:5],
+    }
+    return df2, info
+
+
+def _select_named_params(
+    model: torch.nn.Module,
+    include_regex: Optional[str] = None,
+    exclude_regex: Optional[str] = None,
+) -> List[Tuple[str, torch.nn.Parameter]]:
+    inc = re.compile(include_regex) if include_regex else None
+    exc = re.compile(exclude_regex) if exclude_regex else None
+    params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if inc and not inc.search(name):
+            continue
+        if exc and exc.search(name):
+            continue
+        params.append((name, p))
+    return params
+
+
+def _accumulate_mean_grads(
+    model: STG_NF,
+    loader: DataLoader,
+    device: torch.device,
+    model_confidence: bool,
+    use_conf_score: bool,
+    max_batches: int,
+    include_regex: Optional[str],
+    exclude_regex: Optional[str],
+) -> Dict[str, torch.Tensor]:
+    params = _select_named_params(model, include_regex, exclude_regex)
+    if not params:
+        raise ValueError("No parameters selected for gradient alignment.")
+
+    grad_sum = {name: torch.zeros_like(p, device="cpu") for name, p in params}
+    n = 0
+
+    model.train()
+    it = iter(loader)
+    for _ in range(max_batches):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        x, score, label = prepare_batch(batch, device, model_confidence)
+        _, nll = model(x, label=label)
+        if use_conf_score:
+            nll = nll * reduce_conf_score(score)
+        loss = nll.mean()
+
+        model.zero_grad(set_to_none=True)
+        loss.backward()
+
+        for name, p in params:
+            if p.grad is None:
+                continue
+            grad_sum[name] += p.grad.detach().cpu()
+        n += 1
+
+    if n > 0:
+        for k in grad_sum:
+            grad_sum[k] /= float(n)
+    return grad_sum
+
+
+def select_df3_grad_alignment_train_df(
+    base_model: STG_NF,
+    train_dataset: Dataset,
+    train_sids: List[int],
+    val_dataset: Dataset,
+    val_sids: List[int],
+    device: torch.device,
+    model_confidence: bool,
+    use_conf_score_val: bool,
+    use_conf_score_train: bool,
+    normal_label: int = 1,
+    alpha: float = 0.02,
+    sample_train: int = 4096,
+    sample_val: int = 1024,
+    seed: int = 0,
+    batch_size: int = 1,
+    num_workers: int = 0,
+    include_regex: str = "prior",
+    exclude_regex: Optional[str] = None,
+    max_val_batches: int = 200,
+) -> Tuple[List[int], Dict[str, object]]:
+    rng = random.Random(seed)
+
+    val_label_map = _get_labels_map(val_dataset, val_sids)
+    val_norm = [int(s) for s in val_sids if val_label_map.get(int(s), None) == int(normal_label)]
+    if not val_norm:
+        return [], {"note": "no normal samples in val_sids"}
+
+    if sample_val > 0 and len(val_norm) > sample_val:
+        val_norm = rng.sample(val_norm, sample_val)
+
+    val_loader = build_indexed_loader(
+        val_dataset, val_norm, batch_size=batch_size, num_workers=num_workers, shuffle=True
+    )
+    max_batches = max_val_batches
+    if max_batches <= 0:
+        max_batches = math.ceil(len(val_norm) / max(1, batch_size))
+    g_val = _accumulate_mean_grads(
+        base_model,
+        val_loader,
+        device=device,
+        model_confidence=model_confidence,
+        use_conf_score=use_conf_score_val,
+        max_batches=int(max_batches),
+        include_regex=include_regex,
+        exclude_regex=exclude_regex,
+    )
+
+    train_pool = list(map(int, train_sids))
+    if sample_train > 0 and len(train_pool) > sample_train:
+        train_pool = rng.sample(train_pool, sample_train)
+    if not train_pool:
+        return [], {"note": "empty train pool after sampling"}
+
+    train_loader = build_indexed_loader(
+        train_dataset, train_pool, batch_size=1, num_workers=num_workers, shuffle=True
+    )
+
+    params = _select_named_params(base_model, include_regex, exclude_regex)
+    if not params:
+        raise ValueError("No parameters selected for df3' scoring.")
+
+    scores = []
+    base_model.train()
+    for batch in train_loader:
+        sid = batch[1]
+        if torch.is_tensor(sid):
+            sid = int(sid.item()) if sid.numel() == 1 else int(sid[0].item())
+        elif isinstance(sid, (list, tuple)):
+            sid = int(sid[0])
+        else:
+            sid = int(sid)
+
+        x, score_t, label = prepare_batch(batch, device, model_confidence)
+        _, nll = base_model(x, label=label)
+        if use_conf_score_train:
+            nll = nll * reduce_conf_score(score_t)
+        loss = nll.mean()
+
+        base_model.zero_grad(set_to_none=True)
+        loss.backward()
+
+        align = 0.0
+        for name, p in params:
+            if p.grad is None:
+                continue
+            gv = g_val.get(name, None)
+            if gv is None:
+                continue
+            align += float((p.grad.detach().cpu() * gv).sum().item())
+        scores.append((sid, align))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    k = max(1, int(len(scores) * float(alpha)))
+    df3 = [sid for sid, _ in scores[:k]]
+
+    info = {
+        "alpha": float(alpha),
+        "k": int(k),
+        "sample_train": int(len(scores)),
+        "sample_val_norm": int(len(val_norm)),
+        "include_regex": include_regex,
+        "top5": scores[:5],
+    }
+    return df3, info
 
 
 def load_model_from_checkpoint(args, dataset, checkpoint_path: str) -> STG_NF:

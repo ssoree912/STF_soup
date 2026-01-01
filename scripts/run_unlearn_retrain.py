@@ -6,7 +6,6 @@ import os
 import pickle
 import random
 import sys
-from collections import defaultdict
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if PROJECT_ROOT not in sys.path:
@@ -27,8 +26,9 @@ from utils.unlearning_utils import (
     reduce_conf_score,
     select_df1_tail,
     select_df2_dynamics_v2,
+    select_df2_val_fp_train_df,
+    select_df3_grad_alignment_train_df,
     select_df3_subdomain_train_df,
-    overlap_report,
 )
 from utils.scoring_utils import score_dataset
 
@@ -43,6 +43,26 @@ def sample_val_sids(all_sids, ratio, seed):
         return list(all_sids)
     rng = random.Random(seed)
     return rng.sample(list(all_sids), count)
+
+def filter_val_normals(val_dataset, sids, normal_label=1):
+    out = []
+    if val_dataset is None:
+        return out
+    if hasattr(val_dataset, "labels"):
+        labs = val_dataset.labels
+        for sid in sids:
+            if int(labs[int(sid)]) == int(normal_label):
+                out.append(int(sid))
+        return out
+    for sid in sids:
+        label = val_dataset[int(sid)][-1]
+        if torch.is_tensor(label):
+            label = int(label.item())
+        else:
+            label = int(label)
+        if label == int(normal_label):
+            out.append(int(sid))
+    return out
 
 def forward_nll_components(model, x, label):
     z, logdet = model.flow(x, reverse=False)
@@ -126,8 +146,8 @@ def compute_df3_base_metric(cache_df, df_sids, args, df3_ctx):
     return float("nan")
 
 def compute_unlearn_score(df_name, z, logdet, mean, logs, nll, denom, batch_sids, df3_ctx_torch, args):
-    # df1: nll maximize
-    if df_name == "df1":
+    # df1/df2p/df3p: nll maximize
+    if df_name in ("df1", "df2p", "df3p"):
         return nll, True
 
     # df2: dynamic
@@ -301,7 +321,7 @@ def parse_args():
 
     # mode
     parser.add_argument("--mode", type=str, default="single", choices=["single", "mix"])
-    parser.add_argument("--df_name", type=str, default="df1", choices=["df1", "df2", "df3"],
+    parser.add_argument("--df_name", type=str, default="df1", choices=["df1", "df2", "df3", "df2p", "df3p"],
                         help="used when --mode single")
 
     parser.add_argument("--output_dir", type=str, default="outputs/unlearning")
@@ -321,6 +341,20 @@ def parse_args():
                         choices=["nll", "zsteps_delta", "nll_var"])
     parser.add_argument("--df3_unlearn_loss", type=str, default="emb_norm",
                         choices=["nll", "emb_norm", "cluster_dist"])
+
+    # df2' (val FP) options
+    parser.add_argument("--df2p_knn_k", type=int, default=20)
+    parser.add_argument("--df2p_budget_alpha", type=float, default=0.02)
+    parser.add_argument("--df2p_budget_max", type=int, default=0)
+    parser.add_argument("--normal_label", type=int, default=1)
+
+    # df3' (grad alignment) options
+    parser.add_argument("--df3p_alpha", type=float, default=0.02)
+    parser.add_argument("--df3p_sample_train", type=int, default=4096)
+    parser.add_argument("--df3p_sample_val", type=int, default=1024)
+    parser.add_argument("--df3p_include_regex", type=str, default="prior")
+    parser.add_argument("--df3p_exclude_regex", type=str, default="")
+    parser.add_argument("--df3p_max_val_batches", type=int, default=200)
 
     # val selection
     parser.add_argument("--val_ratio", type=float, default=0.2)
@@ -371,35 +405,84 @@ def main():
     with open(cache_path_val, "rb") as f:
         cache_val = pickle.load(f)
 
-    # 1) tau_base / val_sids
     normal_sids = sorted(cache_train["sB"].keys())
     val_candidates = sorted(cache_val["sB"].keys())
-    val_sids = sample_val_sids(val_candidates, args.val_ratio, args.val_seed)
-
-    if args.tau_from_all_val:
-        s_val_all = np.array([cache_val["sB"][sid] for sid in val_candidates], dtype=np.float32)
-        tau_base = float(np.quantile(s_val_all, args.tau_q))
-    else:
-        s_val_sub = np.array([cache_val["sB"][sid] for sid in val_sids], dtype=np.float32)
-        tau_base = float(np.quantile(s_val_sub, args.tau_q))
-
-    s_val_monitor = np.array([cache_val["sB"][sid] for sid in val_sids], dtype=np.float32)
-    fpr_base = float(np.mean(s_val_monitor >= tau_base))
-    fpr_base = max(fpr_base, 1.0 / max(1, len(val_sids)))
 
     val_split = cache_val.get("meta", {}).get("split", "train")
 
-    # 2) DF select (single이면 해당 df만 뽑음)
+    # 1) dataset / scoring rule
+    dataset, loader = get_dataset_and_loader(args, trans_list=trans_list, only_test=False)
+    train_dataset = dataset["train"]
+    val_dataset = dataset["test"] if val_split == "test" else dataset["train"]
+    test_loader = loader.get("test")
+    test_metadata = dataset.get("test").metadata if dataset.get("test") is not None else None
+
+    # 2) tau_base / val_sids (normal-only)
+    val_sids = sample_val_sids(val_candidates, args.val_ratio, args.val_seed)
+    val_norm_sids = filter_val_normals(val_dataset, val_sids, normal_label=args.normal_label)
+    if not val_norm_sids:
+        val_norm_sids = list(val_sids)
+
+    val_norm_candidates = filter_val_normals(val_dataset, val_candidates, normal_label=args.normal_label)
+    if not val_norm_candidates:
+        val_norm_candidates = list(val_candidates)
+
+    if args.tau_from_all_val:
+        s_val_all = np.array([cache_val["sB"][sid] for sid in val_norm_candidates], dtype=np.float32)
+        tau_base = float(np.quantile(s_val_all, args.tau_q))
+    else:
+        s_val_sub = np.array([cache_val["sB"][sid] for sid in val_norm_sids], dtype=np.float32)
+        tau_base = float(np.quantile(s_val_sub, args.tau_q))
+
+    s_val_monitor = np.array([cache_val["sB"][sid] for sid in val_norm_sids], dtype=np.float32)
+    fpr_base = float(np.mean(s_val_monitor >= tau_base))
+    fpr_base = max(fpr_base, 1.0 / max(1, len(val_norm_sids)))
+
+    device = torch.device(args.device)
+
+    use_conf_score_train = bool(args.model_confidence)
+    use_conf_score_df = bool(cache_train.get("meta", {}).get("use_conf_score", use_conf_score_train))
+    use_conf_score_val = bool(cache_val.get("meta", {}).get("use_conf_score", use_conf_score_train))
+
+    # 3) load base model (df3p needs it)
+    model = load_model_from_checkpoint(args, dataset, args.checkpoint).to(device)
+
+    # 4) DF select (single이면 해당 df만 뽑음)
     df3_cluster_ctx_np = None
+    df_info = {}
     if args.mode == "single":
         if args.df_name == "df1":
             df_sids = sorted(list(select_df1_tail(cache_train["sB"], alpha=args.alpha_df1)))
+            df_info = {"alpha_df1": float(args.alpha_df1)}
         elif args.df_name == "df2":
             df_sids = sorted(list(select_df2_dynamics_v2(
                 cache_train, alpha_g=args.alpha_df2, mode=args.df2_mode,
                 robust=args.df2_robust, trim_ratio=args.df2_trim_ratio, eps=args.df2_eps
             )))
-        else:  # df3
+            df_info = {
+                "alpha_df2": float(args.alpha_df2),
+                "df2_mode": args.df2_mode,
+                "df2_robust": bool(args.df2_robust),
+                "df2_trim_ratio": float(args.df2_trim_ratio),
+                "df2_eps": float(args.df2_eps),
+            }
+        elif args.df_name == "df2p":
+            budget_max = None if args.df2p_budget_max <= 0 else int(args.df2p_budget_max)
+            df_sids, df_info = select_df2_val_fp_train_df(
+                cache_train=cache_train,
+                train_sids=normal_sids,
+                cache_val=cache_val,
+                val_sids=val_sids,
+                val_dataset=val_dataset,
+                tau_base=tau_base,
+                normal_label=int(args.normal_label),
+                knn_k=int(args.df2p_knn_k),
+                budget_alpha=float(args.df2p_budget_alpha),
+                budget_max=budget_max,
+                seed=int(args.val_seed),
+            )
+            df_sids = sorted(list(set(df_sids)))
+        elif args.df_name == "df3":
             if args.df3_unlearn_loss == "cluster_dist":
                 df_sids, info, df3_cluster_ctx_np = select_df3_subdomain_train_df(
                     cache_train, normal_sids, cache_val, val_sids,
@@ -412,25 +495,40 @@ def main():
                     k_clusters=args.k_df3, top_clusters=args.top_clusters, tau_q=args.tau_q
                 )
             df_sids = sorted(list(df_sids))
+            df_info = info
+        elif args.df_name == "df3p":
+            ex = args.df3p_exclude_regex.strip() or None
+            df_sids, df_info = select_df3_grad_alignment_train_df(
+                base_model=model,
+                train_dataset=train_dataset,
+                train_sids=normal_sids,
+                val_dataset=val_dataset,
+                val_sids=val_sids,
+                device=device,
+                model_confidence=bool(args.model_confidence),
+                use_conf_score_val=use_conf_score_val,
+                use_conf_score_train=use_conf_score_train,
+                normal_label=int(args.normal_label),
+                alpha=float(args.df3p_alpha),
+                sample_train=int(args.df3p_sample_train),
+                sample_val=int(args.df3p_sample_val),
+                seed=int(args.val_seed),
+                batch_size=1,
+                num_workers=int(args.num_workers),
+                include_regex=str(args.df3p_include_regex),
+                exclude_regex=ex,
+                max_val_batches=int(args.df3p_max_val_batches),
+            )
+            df_sids = sorted(list(set(df_sids)))
+        else:
+            raise ValueError(f"Unsupported df_name={args.df_name}")
+
         if not df_sids:
-            raise ValueError(f"{args.df_name} selected empty set.")
+            raise ValueError(f"{args.df_name} selected empty set. df_info={df_info}")
     else:
         raise ValueError("For now, run mix with your dedicated mix script later. (mode=single recommended)")
 
-    # 3) dataset / scoring rule
-    dataset, loader = get_dataset_and_loader(args, trans_list=trans_list, only_test=False)
-    train_dataset = dataset["train"]
-    val_dataset = dataset["test"] if val_split == "test" else dataset["train"]
-    test_loader = loader.get("test")
-    test_metadata = dataset.get("test").metadata if dataset.get("test") is not None else None
-
-    device = torch.device(args.device)
-
-    use_conf_score_train = bool(args.model_confidence)
-    use_conf_score_df = bool(cache_train.get("meta", {}).get("use_conf_score", use_conf_score_train))
-    use_conf_score_val = bool(cache_val.get("meta", {}).get("use_conf_score", use_conf_score_train))
-
-    # 4) DR set
+    # 5) DR set
     df_set = set(df_sids)
     dr_sids = [sid for sid in normal_sids if sid not in df_set]
     if args.dr_ratio < 1.0:
@@ -458,9 +556,6 @@ def main():
             "centers": torch.tensor(df3_cluster_ctx_np["centers"], device=device),
             "sid_to_cluster": df3_cluster_ctx_np["sid_to_cluster"],
         }
-
-    # 5) load base model
-    model = load_model_from_checkpoint(args, dataset, args.checkpoint).to(device)
 
     # -----------------------
     # UNLEARN (GA on DF)
@@ -499,7 +594,7 @@ def main():
 
         if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
             val_nll = eval_nll_on_indices(
-                model, val_dataset, val_sids,
+                model, val_dataset, val_norm_sids,
                 device=device, model_confidence=args.model_confidence,
                 batch_size=args.batch_size_retrain,
                 num_workers=args.num_workers,
@@ -560,6 +655,7 @@ def main():
     results = {
         "mode": args.mode,
         "df_name": args.df_name,
+        "df_info": df_info,
         "tau_base": tau_base,
         "fpr_base": fpr_base,
         "val_split": val_split,
