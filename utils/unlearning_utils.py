@@ -512,6 +512,18 @@ def _select_named_params(
         if exc and exc.search(name):
             continue
         params.append((name, p))
+    if inc and not params:
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if exc and exc.search(name):
+                continue
+            params.append((name, p))
+        if params:
+            print(
+                f"[WARN] include_regex '{include_regex}' matched no params; "
+                "fallback to all trainable params."
+            )
     return params
 
 
@@ -653,6 +665,20 @@ def select_df3_grad_alignment_train_df(
         scores.append((sid, align))
 
     scores.sort(key=lambda x: x[1], reverse=True)
+    align_arr = np.array([s for _, s in scores], dtype=np.float32)
+    if align_arr.size:
+        align_q = np.quantile(align_arr, [0.0, 0.5, 0.9, 0.99, 1.0]).tolist()
+        align_stats = {
+            "min": float(align_q[0]),
+            "p50": float(align_q[1]),
+            "p90": float(align_q[2]),
+            "p99": float(align_q[3]),
+            "max": float(align_q[4]),
+            "mean": float(align_arr.mean()),
+            "std": float(align_arr.std()),
+        }
+    else:
+        align_stats = {"note": "no alignment scores"}
     k = max(1, int(len(scores) * float(alpha)))
     df3 = [sid for sid, _ in scores[:k]]
 
@@ -662,6 +688,7 @@ def select_df3_grad_alignment_train_df(
         "sample_train": int(len(scores)),
         "sample_val_norm": int(len(val_norm)),
         "include_regex": include_regex,
+        "align_stats": align_stats,
         "top5": scores[:5],
     }
     return df3, info
