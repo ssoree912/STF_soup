@@ -346,6 +346,8 @@ def parse_args():
     parser.add_argument("--df2p_knn_k", type=int, default=20)
     parser.add_argument("--df2p_budget_alpha", type=float, default=0.02)
     parser.add_argument("--df2p_budget_max", type=int, default=0)
+    parser.add_argument("--df2p_sb_max_q", type=float, default=0.95)
+    parser.add_argument("--df2p_sb_penalty", type=float, default=0.2)
     parser.add_argument("--normal_label", type=int, default=1)
 
     # df3' (grad alignment) options
@@ -483,6 +485,8 @@ def main():
                 knn_k=int(args.df2p_knn_k),
                 budget_alpha=float(args.df2p_budget_alpha),
                 budget_max=budget_max,
+                df2p_sb_max_q=float(args.df2p_sb_max_q),
+                df2p_sb_penalty=float(args.df2p_sb_penalty),
                 seed=int(args.val_seed),
             )
             df_sids = sorted(list(set(df_sids)))

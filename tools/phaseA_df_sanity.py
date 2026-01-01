@@ -155,6 +155,8 @@ def parse_args():
     p.add_argument("--df2p_knn_k", type=int, default=20)
     p.add_argument("--df2p_budget_alpha", type=float, default=0.02)
     p.add_argument("--df2p_budget_max", type=int, default=0)
+    p.add_argument("--df2p_sb_max_q", type=float, default=0.95)
+    p.add_argument("--df2p_sb_penalty", type=float, default=0.2)
     p.add_argument("--normal_label", type=int, default=1)
 
     p.add_argument("--df3p_alpha", type=float, default=0.02)
@@ -291,6 +293,8 @@ def main():
                     knn_k=int(args.df2p_knn_k),
                     budget_alpha=float(args.df2p_budget_alpha),
                     budget_max=budget_max,
+                    df2p_sb_max_q=float(args.df2p_sb_max_q),
+                    df2p_sb_penalty=float(args.df2p_sb_penalty),
                     seed=int(args.val_seed),
                 )
                 df = sorted(list(set(df)))
@@ -366,6 +370,18 @@ def main():
             "size": int(len(sids)),
             "sB_stats_train": sb_stats(cache_train["sB"], sids, tau_base=tau_base),
         }
+
+    if "df1" in per_df_stats and "df2p" in per_df_stats:
+        s1 = per_df_stats["df1"].get("sB_stats_train", {})
+        s2 = per_df_stats["df2p"].get("sB_stats_train", {})
+        m1 = s1.get("mean")
+        m2 = s2.get("mean")
+        p1 = s1.get("p50")
+        p2 = s2.get("p50")
+        if m1 is not None and m2 is not None and m2 >= m1:
+            warnings.append(f"df2p mean sB >= df1 mean sB ({m2:.6g} >= {m1:.6g})")
+        if p1 is not None and p2 is not None and p2 >= p1:
+            warnings.append(f"df2p median sB >= df1 median sB ({p2:.6g} >= {p1:.6g})")
 
     jac = overlap_table(df_sets)
     cont = containment_table(df_sets)

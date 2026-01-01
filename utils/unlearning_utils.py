@@ -405,6 +405,8 @@ def select_df2_val_fp_train_df(
     knn_k: int = 20,
     budget_alpha: float = 0.02,
     budget_max: Optional[int] = None,
+    df2p_sb_max_q: float = 0.95,
+    df2p_sb_penalty: float = 0.2,
     seed: int = 0,
 ) -> Tuple[List[int], Dict[str, object]]:
     val_label_map = _get_labels_map(val_dataset, val_sids)
@@ -420,27 +422,38 @@ def select_df2_val_fp_train_df(
         if float(sb) >= float(tau_base):
             fp_val.append(sid)
 
-    budget = max(1, int(len(train_sids) * float(budget_alpha)))
-    if budget_max is not None:
-        budget = min(budget, int(budget_max))
-
-    tr_ids, tr_X = [], []
+    tr_ids, tr_X, tr_sb = [], [], []
     emb_train = cache_train.get("emb", {})
+    sb_train = cache_train.get("sB", {})
+    sb_vals = np.array([sb_train.get(int(s), 0.0) for s in train_sids if int(s) in sb_train], dtype=np.float32)
+    if sb_vals.size > 0:
+        sb_max = float(np.quantile(sb_vals, float(df2p_sb_max_q)))
+    else:
+        sb_max = float("inf")
+
     for sid in train_sids:
         sid = int(sid)
         emb = emb_train.get(sid, None)
         if emb is None:
             continue
+        sb = float(sb_train.get(sid, 0.0))
+        if sb > sb_max:
+            continue
         tr_ids.append(sid)
         tr_X.append(emb)
+        tr_sb.append(sb)
     tr_X = np.asarray(tr_X, dtype=np.float32)
+    tr_sb = np.asarray(tr_sb, dtype=np.float32)
 
     if tr_X.shape[0] == 0 or len(fp_val) == 0:
         info = {
             "tau_base": float(tau_base),
             "num_fp_val": int(len(fp_val)),
             "train_emb_n": int(tr_X.shape[0]),
-            "budget": int(budget),
+            "budget": 0,
+            "sb_max": float(sb_max),
+            "df2p_sb_max_q": float(df2p_sb_max_q),
+            "df2p_sb_penalty": float(df2p_sb_penalty),
             "note": "empty fp_val or empty embeddings",
         }
         return [], info
@@ -459,10 +472,17 @@ def select_df2_val_fp_train_df(
             "tau_base": float(tau_base),
             "num_fp_val": int(len(fp_val)),
             "train_emb_n": int(tr_X.shape[0]),
-            "budget": int(budget),
+            "budget": 0,
+            "sb_max": float(sb_max),
+            "df2p_sb_max_q": float(df2p_sb_max_q),
+            "df2p_sb_penalty": float(df2p_sb_penalty),
             "note": "fp embeddings missing",
         }
         return [], info
+
+    budget = max(1, int(len(tr_ids) * float(budget_alpha)))
+    if budget_max is not None:
+        budget = min(budget, int(budget_max))
 
     from sklearn.neighbors import NearestNeighbors
     knn_k = max(1, min(int(knn_k), tr_X.shape[0]))
@@ -478,12 +498,20 @@ def select_df2_val_fp_train_df(
             freq[tr_sid] += 1
             dist_sum[tr_sid] += float(dists[q, j])
 
+    sid2sb = {int(s): float(sb) for s, sb in zip(tr_ids, tr_sb)}
     items = []
     for sid, cnt in freq.items():
-        items.append((sid, cnt, dist_sum[sid] / max(1, cnt)))
-    items.sort(key=lambda x: (-x[1], x[2]))
+        dmean = dist_sum[sid] / max(1, cnt)
+        sb = sid2sb.get(int(sid), 0.0)
+        score = (float(cnt) / (float(dmean) + 1e-6)) - float(df2p_sb_penalty) * float(sb)
+        items.append((sid, score, cnt, dmean, sb))
+    items.sort(key=lambda x: x[1], reverse=True)
 
-    df2 = [sid for sid, _, _ in items[:budget]]
+    df2 = [sid for sid, _, _, _, _ in items[:budget]]
+    top5 = [
+        {"sid": int(s), "score": float(sc), "freq": int(c), "dist": float(d), "sb": float(sb)}
+        for s, sc, c, d, sb in items[:5]
+    ]
     info = {
         "tau_base": float(tau_base),
         "num_fp_val": int(len(fp_ids)),
@@ -491,7 +519,10 @@ def select_df2_val_fp_train_df(
         "knn_k": int(knn_k),
         "budget_alpha": float(budget_alpha),
         "budget": int(budget),
-        "top5": items[:5],
+        "sb_max": float(sb_max),
+        "df2p_sb_max_q": float(df2p_sb_max_q),
+        "df2p_sb_penalty": float(df2p_sb_penalty),
+        "top5": top5,
     }
     return df2, info
 
@@ -689,7 +720,7 @@ def select_df3_grad_alignment_train_df(
         "sample_val_norm": int(len(val_norm)),
         "include_regex": include_regex,
         "align_stats": align_stats,
-        "top5": scores[:5],
+        "top5": [{"sid": int(s), "align": float(a)} for s, a in scores[:5]],
     }
     return df3, info
 
