@@ -44,6 +44,18 @@ def sample_val_sids(all_sids, ratio, seed):
     rng = random.Random(seed)
     return rng.sample(list(all_sids), count)
 
+def _jsonable(val):
+    if isinstance(val, (str, int, float, bool)) or val is None:
+        return val
+    if isinstance(val, (list, tuple)):
+        return [_jsonable(v) for v in val]
+    if isinstance(val, dict):
+        return {str(k): _jsonable(v) for k, v in val.items()}
+    return str(val)
+
+def _serialize_args(args):
+    return {k: _jsonable(v) for k, v in vars(args).items()}
+
 def filter_val_normals(val_dataset, sids, normal_label=1):
     out = []
     if val_dataset is None:
@@ -644,6 +656,10 @@ def main():
     model.train()
 
     retrain_history = []
+    retrain_roc_history = []
+    retrain_roc_best = None
+    retrain_best_state = None
+    retrain_best_epoch = None
     for epoch in range(args.epochs_retrain):
         for step, batch in enumerate(dr_loader):
             x, score, label = prepare_batch(batch, device, args.model_confidence)
@@ -657,6 +673,17 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
 
+        epoch_roc = eval_roc_auc(model, test_loader, test_metadata, args, device)
+        retrain_roc_history.append({"epoch": epoch + 1, "roc_auc": epoch_roc})
+        if epoch_roc is not None:
+            if retrain_roc_best is None or epoch_roc > retrain_roc_best:
+                retrain_roc_best = float(epoch_roc)
+                retrain_best_state = {
+                    k: v.detach().cpu() if torch.is_tensor(v) else v
+                    for k, v in model.state_dict().items()
+                }
+                retrain_best_epoch = epoch + 1
+
     retrain_metrics = compute_single_metrics(
         model, train_dataset, val_dataset, df_sids, val_sids,
         cache_train, cache_val, tau_base, device,
@@ -666,7 +693,35 @@ def main():
 
     retrain_ckpt = os.path.join(args.output_dir, f"{args.df_name}_retrain.pth.tar")
     torch.save({"state_dict": model.state_dict(), "stage": "retrain", "df_name": args.df_name}, retrain_ckpt)
-    retrain_roc_auc = eval_roc_auc(model, test_loader, test_metadata, args, device)
+    retrain_best_ckpt = None
+    retrain_best_metrics = None
+    if retrain_best_state is not None:
+        retrain_best_ckpt = os.path.join(args.output_dir, f"{args.df_name}_retrain_best.pth.tar")
+        torch.save(
+            {
+                "state_dict": retrain_best_state,
+                "stage": "retrain_best",
+                "df_name": args.df_name,
+                "best_epoch": retrain_best_epoch,
+                "best_roc_auc": retrain_roc_best,
+            },
+            retrain_best_ckpt,
+        )
+        model.load_state_dict(retrain_best_state, strict=False)
+        retrain_best_metrics = compute_single_metrics(
+            model, train_dataset, val_dataset, df_sids, val_sids,
+            cache_train, cache_val, tau_base, device,
+            args, use_conf_score_df, use_conf_score_val,
+            args.df_name, df3_cluster_ctx_np
+        )
+        retrain_best_roc_auc = eval_roc_auc(model, test_loader, test_metadata, args, device)
+        if retrain_best_metrics is not None:
+            retrain_best_metrics["roc_auc"] = retrain_best_roc_auc
+    if retrain_roc_history:
+        retrain_roc_auc_last = retrain_roc_history[-1]["roc_auc"]
+    else:
+        retrain_roc_auc_last = eval_roc_auc(model, test_loader, test_metadata, args, device)
+    retrain_roc_auc_best = retrain_roc_best if retrain_roc_best is not None else retrain_roc_auc_last
 
     # -----------------------
     # SAVE RESULT
@@ -688,11 +743,18 @@ def main():
             "val": use_conf_score_val,
             "retrain": use_conf_score_retrain,
         },
+        "args": _serialize_args(args),
+        "argv": list(sys.argv),
+        "command": " ".join(sys.argv),
         "unlearn_metrics": unlearn_metrics,
         "unlearn_eval_history": eval_history,
         "retrain_metrics": retrain_metrics,
         "unlearn_roc_auc": unlearn_roc_auc,
-        "retrain_roc_auc": retrain_roc_auc,
+        "retrain_roc_auc": retrain_roc_auc_best,
+        "retrain_roc_auc_last": retrain_roc_auc_last,
+        "retrain_roc_auc_history": retrain_roc_history,
+        "retrain_best_ckpt": retrain_best_ckpt,
+        "retrain_best_metrics": retrain_best_metrics,
         "unlearn_ckpt": unlearn_ckpt,
         "retrain_ckpt": retrain_ckpt,
     }

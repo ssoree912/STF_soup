@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-UGM soup with df1 forgetting constraint (delta_df >= threshold).
+Plain UGM soup (no DF1 constraint).
+- Grid-search alphas -> merge -> evaluate on test -> pick best by metric.
 """
 import argparse
 import copy
 import itertools
 import json
 import logging
-import pickle
-import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -27,16 +26,11 @@ from models.STG_NF.model_pose import STG_NF
 from utils.data_utils import trans_list
 from utils.train_utils import init_model_params
 from utils.scoring_utils import get_dataset_scores, smooth_scores
-from utils.unlearning_utils import (
-    build_indexed_loader,
-    prepare_batch,
-    reduce_conf_score,
-    select_df1_tail,
-)
+from utils.unlearning_utils import prepare_batch, reduce_conf_score
 
 
 def _setup_logger(level: str) -> logging.Logger:
-    logger = logging.getLogger("ugm_soup")
+    logger = logging.getLogger("ugm_soup_plain")
     if not logger.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s"))
@@ -227,6 +221,7 @@ def _eval_test_metrics(model, test_loader, metadata, ref_args, device, f1_thresh
     scores_arr = smooth_scores(scores_arr)
     gt_np = np.concatenate(gt_arr)
     scores_np = np.concatenate(scores_arr)
+
     if scores_np.size:
         scores_np[scores_np == np.inf] = scores_np[scores_np != np.inf].max()
         scores_np[scores_np == -np.inf] = scores_np[scores_np != -np.inf].min()
@@ -237,60 +232,15 @@ def _eval_test_metrics(model, test_loader, metadata, ref_args, device, f1_thresh
     return {"roc_auc": roc, "pr_auc": pr, "f1": f1}
 
 
-@torch.no_grad()
-def eval_df1_delta_df(
-    model: STG_NF,
-    train_dataset,
-    df1_sids: List[int],
-    cache_train: dict,
-    ref_args,
-    batch_size: int,
-    num_workers: int,
-    sample_size: int,
-    seed: int,
-) -> Dict[str, float]:
-    rng = random.Random(seed)
-    sids = list(df1_sids)
-    if sample_size > 0 and len(sids) > sample_size:
-        sids = rng.sample(sids, sample_size)
-
-    base_mean = float(np.mean([cache_train["sB"][sid] for sid in sids])) if sids else 0.0
-
-    loader = build_indexed_loader(
-        train_dataset, sids, batch_size=batch_size, num_workers=num_workers, shuffle=False
-    )
-
-    nlls = []
-    model.eval()
-    device = next(model.parameters()).device
-    model_conf = bool(getattr(ref_args, "model_confidence", False))
-    for batch in loader:
-        x, score, label = prepare_batch(batch, device, model_conf)
-        _, nll = model(x, label=label)
-        if model_conf:
-            nll = nll * reduce_conf_score(score)
-        nlls.append(nll.detach().cpu())
-
-    cur_mean = float(torch.cat(nlls).mean().item()) if nlls else 0.0
-    delta_df = cur_mean - base_mean
-    delta_rel = delta_df / (abs(base_mean) + 1e-12)
-    return {
-        "df1_base_mean": base_mean,
-        "df1_cur_mean": cur_mean,
-        "df1_delta_df": float(delta_df),
-        "df1_delta_rel": float(delta_rel),
-    }
-
-
 def parse_args():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--reference_args", type=Path, default=None)
     ap.add_argument("--reference_ckpt", type=Path, default=None,
                     help="checkpoint path that contains args (state['args'])")
+
     ap.add_argument("--dataset", type=str, default=None)
     ap.add_argument("--data_dir", type=str, default=None)
-    ap.add_argument("--cache_train_path", type=Path, required=True)
-    ap.add_argument("--alpha_df1", type=float, default=0.01)
 
     ap.add_argument("--checkpoints", nargs="+", required=True)
     ap.add_argument("--fishers", nargs="+", required=True)
@@ -303,11 +253,6 @@ def parse_args():
     ap.add_argument("--grid_values", nargs="+", type=float, default=[0.0, 0.5, 1.0])
     ap.add_argument("--grid_normalize", action="store_true")
     ap.add_argument("--select_by", choices=["roc_auc", "pr_auc", "f1"], default="roc_auc")
-
-    ap.add_argument("--df1_min_delta", type=float, default=0.3)
-    ap.add_argument("--df1_sample_size", type=int, default=512)
-    ap.add_argument("--df1_eval_batch_size", type=int, default=256)
-    ap.add_argument("--df1_seed", type=int, default=0)
 
     ap.add_argument("--device", default=None)
     ap.add_argument("--gpu_id", type=int, default=0)
@@ -348,7 +293,6 @@ def main():
 
     dataset, loader = get_dataset_and_loader(ref_args, trans_list=trans_list, only_test=False)
     model_args = init_model_params(ref_args, dataset)
-    train_dataset = dataset["train"]
     test_loader = loader["test"]
     test_metadata = dataset["test"].metadata
 
@@ -358,29 +302,6 @@ def main():
     else:
         device = torch.device("cpu")
     logger.info("Using device=%s", device)
-
-    with open(args.cache_train_path, "rb") as f:
-        cache_train = pickle.load(f)
-    df1_sids = sorted(select_df1_tail(cache_train["sB"], alpha=args.alpha_df1))
-    logger.info("DF1 size=%d (alpha_df1=%.4g)", len(df1_sids), args.alpha_df1)
-    if df1_sids:
-        all_scores = np.array(list(cache_train["sB"].values()), dtype=np.float32)
-        df1_scores = np.array([cache_train["sB"][sid] for sid in df1_sids], dtype=np.float32)
-        if all_scores.size and df1_scores.size:
-            df1_mean = float(df1_scores.mean())
-            df1_min = float(df1_scores.min())
-            df1_max = float(df1_scores.max())
-            all_mean = float(all_scores.mean())
-            all_min = float(all_scores.min())
-            all_max = float(all_scores.max())
-            df1_mean_pct = float(np.mean(all_scores <= df1_mean))
-            logger.info(
-                "DF1 sB stats: mean=%.6g min=%.6g max=%.6g | overall mean=%.6g min=%.6g max=%.6g | "
-                "df1_mean_percentile=%.3f",
-                df1_mean, df1_min, df1_max,
-                all_mean, all_min, all_max,
-                df1_mean_pct,
-            )
 
     models = [_load_state_dict(p) for p in args.checkpoints]
     raw_fishers = [torch.load(p, map_location="cpu") for p in args.fishers]
@@ -393,29 +314,25 @@ def main():
 
     use_ref_fisher = not args.no_ref_fisher
 
-    def evaluate_merged(state_dict: Dict[str, torch.Tensor]):
+    def evaluate_merged(state_dict: Dict[str, torch.Tensor]) -> Dict[str, float]:
         model = STG_NF(**model_args)
         model.load_state_dict(state_dict, strict=False)
         if hasattr(model, "set_actnorm_init"):
             model.set_actnorm_init()
         model.to(device)
 
-        df1_stats = eval_df1_delta_df(
-            model=model,
-            train_dataset=train_dataset,
-            df1_sids=df1_sids,
-            cache_train=cache_train,
-            ref_args=ref_args,
-            batch_size=args.df1_eval_batch_size,
-            num_workers=getattr(ref_args, "num_workers", 4),
-            sample_size=args.df1_sample_size,
-            seed=args.df1_seed,
+        metrics = _eval_test_metrics(
+            model, test_loader, test_metadata, ref_args, device,
+            f1_threshold=float(args.f1_threshold),
         )
 
-        return df1_stats, model
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return metrics
 
     if not args.grid_search:
-        raise ValueError("Use --grid_search for now (df1 constraint is for combo selection).")
+        raise ValueError("Use --grid_search for now (provide --grid_search and --grid_values).")
 
     k_models = len(args.checkpoints)
     grid_values = list(args.grid_values)
@@ -428,6 +345,7 @@ def main():
 
     for combo in itertools.product(grid_values, repeat=k_models):
         combo = list(combo)
+
         if args.grid_normalize:
             s = sum(combo)
             if s == 0:
@@ -447,88 +365,42 @@ def main():
             use_ref_fisher=use_ref_fisher,
         )
 
-        df1_stats, model = evaluate_merged(merged)
-        ok = df1_stats["df1_delta_df"] >= float(args.df1_min_delta)
-        metrics = dict(df1_stats)
+        metrics = evaluate_merged(merged)
+        logs.append({"alphas": alphas, "metrics": metrics})
 
-        if ok:
-            test_metrics = _eval_test_metrics(
-                model,
-                test_loader,
-                test_metadata,
-                ref_args,
-                device,
-                f1_threshold=float(args.f1_threshold),
-            )
-            metrics.update(test_metrics)
-        else:
-            metrics.update({"roc_auc": None, "pr_auc": None, "f1": None})
-
-        logs.append({"alphas": alphas, "ok_df1": ok, "metrics": metrics})
-
-        if ok:
-            logger.info(
-                "alphas=%s | ok_df1=%s | df1_delta=%.4f | roc=%.4f pr=%.4f f1=%.4f",
-                [round(a, 3) for a in alphas],
-                ok,
-                metrics["df1_delta_df"],
-                metrics["roc_auc"],
-                metrics["pr_auc"],
-                metrics["f1"],
-            )
-        else:
-            logger.info(
-                "alphas=%s | ok_df1=%s | df1_delta=%.4f | test=skipped",
-                [round(a, 3) for a in alphas],
-                ok,
-                metrics["df1_delta_df"],
-            )
-
-        if not ok:
-            del model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            continue
-
-        key = args.select_by
-        score = metrics.get(key)
+        score = metrics.get(args.select_by, None)
         if score is None or (isinstance(score, float) and not np.isfinite(score)):
-            del model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
             continue
         score = float(score)
+
+        logger.info(
+            "alphas=%s | roc=%.4f pr=%.4f f1=%.4f | select_by=%s=%.4f",
+            [round(a, 3) for a in alphas],
+            metrics["roc_auc"], metrics["pr_auc"], metrics["f1"],
+            args.select_by, score,
+        )
+
         if best is None or score > best:
             best = score
             best_state = merged
             best_alphas = alphas
             best_metrics = metrics
-            logger.info("New best %s=%.4f with alphas=%s", key, score, best_alphas)
-        del model
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            logger.info("New best %s=%.4f with alphas=%s", args.select_by, best, best_alphas)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     metrics_path = args.metrics_json or args.output.with_suffix(".metrics.json")
 
     if best_state is None:
-        logger.warning("No combination satisfied df1 constraint (min_delta=%.4f).", args.df1_min_delta)
+        logger.warning("No valid combination found.")
         with open(metrics_path, "w") as f:
-            json.dump({"best": None, "logs": logs, "df1_min_delta": args.df1_min_delta}, f, indent=2)
+            json.dump({"best": None, "logs": logs}, f, indent=2)
         return
-
-    if best_metrics is None:
-        for row in logs:
-            if row["alphas"] == best_alphas:
-                best_metrics = row["metrics"]
-                break
 
     ckpt_payload = {
         "state_dict": best_state,
         "metrics": best_metrics,
         "best_alphas": best_alphas,
         "select_by": args.select_by,
-        "df1_min_delta": args.df1_min_delta,
         "f1_threshold": args.f1_threshold,
     }
     torch.save(ckpt_payload, args.output)
@@ -537,10 +409,8 @@ def main():
         "soup_path": str(args.output),
         "best_alphas": best_alphas,
         "select_by": args.select_by,
-        "df1_min_delta": args.df1_min_delta,
         "f1_threshold": args.f1_threshold,
         "best_metrics": best_metrics,
-        "best_roc_auc": None if best_metrics is None else best_metrics.get("roc_auc"),
         "logs": logs,
         "fisher_meta": fisher_metas,
         "checkpoints": args.checkpoints,

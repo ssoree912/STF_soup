@@ -33,6 +33,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -148,6 +149,34 @@ def extract_normality_scores(
     return out
 
 
+def _extract_normality_scores_indexed(
+    model: STG_NF,
+    dataset,
+    indices: List[int],
+    ref_args,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+) -> np.ndarray:
+    if not indices:
+        return np.zeros((0,), dtype=np.float32)
+    subset = Subset(dataset, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    model.eval()
+    scores: List[torch.Tensor] = []
+    model_conf = bool(getattr(ref_args, "model_confidence", False))
+    for batch in loader:
+        x, conf_score, _ = prepare_batch(batch, device, model_conf)
+        label = torch.ones(x.size(0), device=device)
+        _, nll = model(x, label=label)
+        if model_conf:
+            nll = nll * reduce_conf_score(conf_score)
+        scores.append((-1.0 * nll).detach().cpu())
+    if not scores:
+        return np.zeros((0,), dtype=np.float32)
+    return torch.cat(scores, dim=0).view(-1).numpy().astype(np.float32, copy=False)
+
+
 def _zscore(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     m = float(x.mean()) if x.size else 0.0
     s = float(x.std()) if x.size else 1.0
@@ -162,6 +191,47 @@ def _rank01(x: np.ndarray) -> np.ndarray:
     ranks = np.empty_like(order, dtype=np.float32)
     ranks[order] = np.linspace(0.0, 1.0, num=x.size, dtype=np.float32)
     return ranks
+
+
+def _get_normal_indices(dataset, normal_label: int = 1) -> List[int]:
+    if hasattr(dataset, "labels"):
+        return [i for i, y in enumerate(dataset.labels) if int(y) == int(normal_label)]
+    return list(range(len(dataset)))
+
+
+def _ecdf_p_left(cal_sorted: np.ndarray, x: np.ndarray) -> np.ndarray:
+    n = cal_sorted.size
+    if n == 0:
+        return np.full_like(x, 0.5, dtype=np.float32)
+    idx = np.searchsorted(cal_sorted, x, side="right")
+    p = (idx + 1.0) / (n + 2.0)
+    return p.astype(np.float32, copy=False)
+
+
+def _ecdf_p_right(cal_sorted: np.ndarray, x: np.ndarray) -> np.ndarray:
+    n = cal_sorted.size
+    if n == 0:
+        return np.full_like(x, 0.5, dtype=np.float32)
+    idx = np.searchsorted(cal_sorted, x, side="left")
+    cnt_ge = n - idx
+    p = (cnt_ge + 1.0) / (n + 2.0)
+    return p.astype(np.float32, copy=False)
+
+
+def _fisher_combine(p_stack: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    p = np.clip(p_stack, eps, 1.0)
+    return (-2.0 * np.sum(np.log(p), axis=0)).astype(np.float32)
+
+
+def _stouffer_combine(p_stack: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    from scipy.stats import norm
+    p = np.clip(p_stack, eps, 1.0 - eps)
+    z = norm.ppf(1.0 - p)
+    return (np.sum(z, axis=0) / np.sqrt(p.shape[0])).astype(np.float32)
+
+
+def _min_combine(p_stack: np.ndarray) -> np.ndarray:
+    return (1.0 - np.min(p_stack, axis=0)).astype(np.float32)
 
 
 def _compute_metrics_from_normality_scores(
@@ -220,6 +290,14 @@ def parse_args():
     ap.add_argument("--force_recompute", action="store_true",
                     help="Ignore cached .npy and recompute scores.")
 
+    ap.add_argument("--pvalue_ensemble", action="store_true",
+                    help="Use normal-only ECDF to compute p-values and combine them.")
+    ap.add_argument("--pvalue_tail", choices=["left", "right"], default="left",
+                    help="left: p = P(cal <= s). right: p = P(cal >= s)")
+    ap.add_argument("--pvalue_cal_split", choices=["train", "test"], default="train",
+                    help="Calibration split for ECDF (normal-only).")
+    ap.add_argument("--pvalue_normal_label", type=int, default=1)
+
     ap.add_argument("--output_json", type=Path, required=True)
     return ap.parse_args()
 
@@ -259,7 +337,8 @@ def main():
 
     ref_args, model_args = init_sub_args(ref_args)
 
-    dataset, loader = get_dataset_and_loader(ref_args, trans_list=trans_list, only_test=True)
+    only_test = not bool(args.pvalue_ensemble)
+    dataset, loader = get_dataset_and_loader(ref_args, trans_list=trans_list, only_test=only_test)
     model_args = init_model_params(ref_args, dataset)
 
     test_loader = loader["test"]
@@ -376,6 +455,72 @@ def main():
                 best_metrics = metrics
                 logger.info("New best %s=%.4f with alphas=%s metrics=%s", args.select_by, best, best_alphas, best_metrics)
 
+    pvalue_ensembles = None
+    if args.pvalue_ensemble:
+        cal_split = args.pvalue_cal_split
+        if cal_split == "test":
+            logger.warning("pvalue_cal_split=test uses evaluation split for calibration.")
+        if cal_split not in dataset:
+            raise ValueError(f"pvalue_cal_split={cal_split} not found in dataset.")
+        ds_cal = dataset[cal_split]
+        cal_idx = _get_normal_indices(ds_cal, normal_label=args.pvalue_normal_label)
+        if not cal_idx:
+            logger.warning("No normal samples found for calibration; using full split.")
+            cal_idx = list(range(len(ds_cal)))
+
+        cal_scores_list = []
+        for ckpt_path, ckpt_name in zip(args.checkpoints, ckpt_names):
+            cal_cache = None
+            if args.save_scores_dir is not None:
+                cal_cache = args.save_scores_dir / f"{ckpt_name}.cal_{cal_split}.npy"
+            if cal_cache is not None and cal_cache.exists() and not args.force_recompute:
+                logger.info("Loading cached cal scores: %s", cal_cache)
+                cal_scores = np.load(cal_cache)
+            else:
+                logger.info("Loading checkpoint for cal: %s", ckpt_path)
+                state = _load_ckpt_state(ckpt_path)
+                model = STG_NF(**model_args)
+                model.load_state_dict(state, strict=False)
+                if hasattr(model, "set_actnorm_init"):
+                    model.set_actnorm_init()
+                model.to(device)
+                cal_scores = _extract_normality_scores_indexed(
+                    model=model,
+                    dataset=ds_cal,
+                    indices=cal_idx,
+                    ref_args=ref_args,
+                    device=device,
+                    batch_size=getattr(ref_args, "batch_size", 256),
+                    num_workers=getattr(ref_args, "num_workers", 4),
+                )
+                if cal_cache is not None:
+                    np.save(cal_cache, cal_scores)
+                    logger.info("Saved cached cal scores: %s", cal_cache)
+                del model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            cal_scores_list.append(cal_scores.astype(np.float32, copy=False))
+
+        p_list = []
+        for cal_scores, test_scores in zip(cal_scores_list, scores_list):
+            cal_sorted = np.sort(cal_scores.astype(np.float32, copy=False))
+            if args.pvalue_tail == "left":
+                p = _ecdf_p_left(cal_sorted, test_scores)
+            else:
+                p = _ecdf_p_right(cal_sorted, test_scores)
+            p_list.append(p)
+        p_stack = np.stack(p_list, axis=0)
+
+        anom_fisher = _fisher_combine(p_stack)
+        anom_stouffer = _stouffer_combine(p_stack)
+        anom_min = _min_combine(p_stack)
+
+        pvalue_ensembles = {
+            "pvalue_fisher": _compute_metrics_from_normality_scores(-anom_fisher, test_metadata, ref_args, args.f1_threshold),
+            "pvalue_stouffer": _compute_metrics_from_normality_scores(-anom_stouffer, test_metadata, ref_args, args.f1_threshold),
+            "pvalue_min": _compute_metrics_from_normality_scores(-anom_min, test_metadata, ref_args, args.f1_threshold),
+        }
+
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     out = {
         "reference_source": reference_source,
@@ -387,9 +532,14 @@ def main():
         "grid_values": list(args.grid_values),
         "grid_normalize": bool(args.grid_normalize),
         "select_by": args.select_by,
+        "pvalue_ensemble": bool(args.pvalue_ensemble),
+        "pvalue_tail": args.pvalue_tail,
+        "pvalue_cal_split": args.pvalue_cal_split,
+        "pvalue_normal_label": int(args.pvalue_normal_label),
         "best_alphas": best_alphas,
         "best_metrics": best_metrics,
         "logs": logs,
+        "pvalue_ensembles": pvalue_ensembles,
     }
     with open(args.output_json, "w") as f:
         json.dump(out, f, indent=2)
