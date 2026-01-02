@@ -398,6 +398,7 @@ def parse_args():
     parser.add_argument("--lambda_distill", type=float, default=0.0)
     parser.add_argument("--lambda_ewc", type=float, default=0.0)
     parser.add_argument("--ewc_max_batches", type=int, default=200)
+    parser.add_argument("--lambda_repair", type=float, default=0.0)
 
     # SLUG: update only selected params during UNLEARN
     parser.add_argument("--unlearn_include_regex", type=str, default="")
@@ -474,6 +475,13 @@ def main():
     s_val_monitor = np.array([cache_val["sB"][sid] for sid in val_norm_sids], dtype=np.float32)
     fpr_base = float(np.mean(s_val_monitor >= tau_base))
     fpr_base = max(fpr_base, 1.0 / max(1, len(val_norm_sids)))
+
+    fp_val_norm_sids = []
+    if args.df_name == "df2p" and args.lambda_repair > 0:
+        fp_pool = val_norm_candidates if args.tau_from_all_val else val_norm_sids
+        for sid in fp_pool:
+            if cache_val["sB"].get(int(sid), 0.0) >= tau_base:
+                fp_val_norm_sids.append(int(sid))
 
     device = torch.device(args.device)
 
@@ -563,14 +571,6 @@ def main():
             raise ValueError(f"Unsupported df_name={args.df_name}")
 
         # ----- DF별 권장 기본값 (원하면 주석 처리 가능) -----
-        if args.df_name == "df2" and args.df2_unlearn_loss != "nll":
-            print("[INFO] DF2: forcing df2_unlearn_loss=nll for safer unlearning objective.")
-            args.df2_unlearn_loss = "nll"
-
-        if args.df_name == "df3" and args.df3_unlearn_loss != "nll":
-            print("[INFO] DF3: forcing df3_unlearn_loss=nll for safer unlearning objective.")
-            args.df3_unlearn_loss = "nll"
-
         if args.df_name in ("df2p", "df3p") and not args.unlearn_include_regex.strip():
             args.unlearn_include_regex = "prior"
             print("[INFO] SLUG default: unlearn_include_regex='prior'")
@@ -611,6 +611,21 @@ def main():
         num_workers=args.num_workers,
         shuffle=True,
     )
+
+    repair_loader = None
+    repair_it = None
+    if args.lambda_repair > 0 and args.df_name == "df2p":
+        if fp_val_norm_sids:
+            repair_loader = build_indexed_loader(
+                val_dataset,
+                fp_val_norm_sids,
+                batch_size=args.batch_size_unlearn,
+                num_workers=args.num_workers,
+                shuffle=True,
+            )
+            repair_it = iter(repair_loader)
+        else:
+            print("[WARN] lambda_repair>0 but no FP val normals found; repair disabled.")
 
     # df3 ctx torch (only if needed)
     df3_ctx_torch = None
@@ -728,12 +743,27 @@ def main():
                 exclude_regex=exclude_rgx,
             )
 
+        # --- Repair term (val FP 정상 NLL 감소) ---
+        loss_repair = torch.tensor(0.0, device=device)
+        if args.lambda_repair > 0 and repair_it is not None:
+            try:
+                batch_rp = next(repair_it)
+            except StopIteration:
+                repair_it = iter(repair_loader)
+                batch_rp = next(repair_it)
+            x_rp, score_rp, label_rp = prepare_batch(batch_rp, device, args.model_confidence)
+            _, nll_rp = model(x_rp, label=label_rp)
+            if use_conf_score_val:
+                nll_rp = nll_rp * reduce_conf_score(score_rp)
+            loss_repair = nll_rp.mean()
+
         # total
         loss = (
             args.lambda_forget * loss_forget
             + args.lambda_retain * loss_retain
             + args.lambda_distill * loss_distill
             + args.lambda_ewc * loss_ewc
+            + args.lambda_repair * loss_repair
         )
 
         opt.zero_grad(set_to_none=True)
