@@ -183,6 +183,11 @@ def _zscore(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     s = max(s, eps)
     return ((x - m) / s).astype(np.float32, copy=False)
 
+def _zscore_with_stats(x: np.ndarray, mean: float, std: float, eps: float = 1e-8) -> np.ndarray:
+    s = float(std)
+    s = max(s, eps)
+    return ((x - float(mean)) / s).astype(np.float32, copy=False)
+
 
 def _rank01(x: np.ndarray) -> np.ndarray:
     if x.size == 0:
@@ -222,6 +227,12 @@ def _fisher_combine(p_stack: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     p = np.clip(p_stack, eps, 1.0)
     return (-2.0 * np.sum(np.log(p), axis=0)).astype(np.float32)
 
+def _fisher_combine_weighted(p_stack: np.ndarray, weights: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    p = np.clip(p_stack, eps, 1.0)
+    w = np.asarray(weights, dtype=np.float32).reshape(-1, 1)
+    w = w / (float(w.sum()) + 1e-12)
+    return (-2.0 * np.sum(w * np.log(p), axis=0)).astype(np.float32)
+
 
 def _stouffer_combine(p_stack: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     from scipy.stats import norm
@@ -229,9 +240,33 @@ def _stouffer_combine(p_stack: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     z = norm.ppf(1.0 - p)
     return (np.sum(z, axis=0) / np.sqrt(p.shape[0])).astype(np.float32)
 
+def _stouffer_combine_weighted(p_stack: np.ndarray, weights: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    from scipy.stats import norm
+    p = np.clip(p_stack, eps, 1.0 - eps)
+    z = norm.ppf(1.0 - p)
+    w = np.asarray(weights, dtype=np.float32).reshape(-1, 1)
+    w = w / (float(w.sum()) + 1e-12)
+    denom = float(np.sqrt(np.sum(w.squeeze() ** 2)) + 1e-12)
+    return (np.sum(w * z, axis=0) / denom).astype(np.float32)
+
 
 def _min_combine(p_stack: np.ndarray) -> np.ndarray:
     return (1.0 - np.min(p_stack, axis=0)).astype(np.float32)
+
+def _best_f1_quantile_threshold(sc: np.ndarray, gt: np.ndarray) -> Dict[str, float]:
+    if sc.size == 0 or gt.size == 0 or len(np.unique(gt)) < 2:
+        return {"best_f1": float("nan"), "best_thr": float("nan")}
+    qs = np.linspace(0.01, 0.99, 99, dtype=np.float32)
+    thrs = np.quantile(sc, qs)
+    best_f1 = -1.0
+    best_thr = float(thrs[0])
+    for thr in thrs:
+        pred = (sc >= float(thr))
+        f1v = float(f1_score(gt, pred, zero_division=0))
+        if f1v > best_f1:
+            best_f1 = f1v
+            best_thr = float(thr)
+    return {"best_f1": float(best_f1), "best_thr": float(best_thr)}
 
 
 def _compute_metrics_from_normality_scores(
@@ -255,7 +290,56 @@ def _compute_metrics_from_normality_scores(
     roc = float(roc_auc_score(gt_np, sc_np)) if gt_np.size else 0.0
     pr = float(average_precision_score(gt_np, sc_np)) if gt_np.size else 0.0
     f1 = float(f1_score(gt_np, sc_np >= float(f1_threshold))) if gt_np.size else 0.0
-    return {"roc_auc": roc, "pr_auc": pr, "f1": f1}
+    best = _best_f1_quantile_threshold(sc_np, gt_np) if gt_np.size else {"best_f1": float("nan"), "best_thr": float("nan")}
+    return {
+        "roc_auc": roc,
+        "pr_auc": pr,
+        "f1": f1,
+        "best_f1": float(best["best_f1"]),
+        "best_thr": float(best["best_thr"]),
+    }
+
+def _load_or_compute_scores_for_indices(
+    ckpt_path: str,
+    ckpt_name: str,
+    split_tag: str,
+    dataset_split,
+    indices: List[int],
+    model_args,
+    ref_args,
+    device: torch.device,
+    save_scores_dir: Optional[Path],
+    force_recompute: bool,
+) -> np.ndarray:
+    cache_path = None
+    if save_scores_dir is not None:
+        cache_path = save_scores_dir / f"{ckpt_name}.{split_tag}.npy"
+        if cache_path.exists() and not force_recompute:
+            return np.load(cache_path).astype(np.float32, copy=False)
+
+    state = _load_ckpt_state(ckpt_path)
+    model = STG_NF(**model_args)
+    model.load_state_dict(state, strict=False)
+    if hasattr(model, "set_actnorm_init"):
+        model.set_actnorm_init()
+    model.to(device)
+
+    scores = _extract_normality_scores_indexed(
+        model=model,
+        dataset=dataset_split,
+        indices=indices,
+        ref_args=ref_args,
+        device=device,
+        batch_size=getattr(ref_args, "batch_size", 256),
+        num_workers=getattr(ref_args, "num_workers", 4),
+    )
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    if cache_path is not None:
+        np.save(cache_path, scores)
+    return scores.astype(np.float32, copy=False)
 
 
 def parse_args():
@@ -297,6 +381,13 @@ def parse_args():
     ap.add_argument("--pvalue_cal_split", choices=["train", "test"], default="train",
                     help="Calibration split for ECDF (normal-only).")
     ap.add_argument("--pvalue_normal_label", type=int, default=1)
+    ap.add_argument("--pvalue_weights", nargs="+", type=float, default=None,
+                    help="Optional weights for weighted p-value combine.")
+
+    ap.add_argument("--zscore_cal_split", choices=["none", "train", "test"], default="train",
+                    help="Where to estimate (mean,std) for zscore calibration.")
+    ap.add_argument("--zscore_normal_label", type=int, default=1,
+                    help="Normal label used for zscore calibration.")
 
     ap.add_argument("--output_json", type=Path, required=True)
     return ap.parse_args()
@@ -337,7 +428,9 @@ def main():
 
     ref_args, model_args = init_sub_args(ref_args)
 
-    only_test = not bool(args.pvalue_ensemble)
+    need_train_for_p = bool(args.pvalue_ensemble and args.pvalue_cal_split == "train")
+    need_train_for_z = bool(args.normalize_scores == "zscore" and args.zscore_cal_split == "train")
+    only_test = not (need_train_for_p or need_train_for_z)
     dataset, loader = get_dataset_and_loader(ref_args, trans_list=trans_list, only_test=only_test)
     model_args = init_model_params(ref_args, dataset)
 
@@ -392,15 +485,47 @@ def main():
             raise RuntimeError(f"Score length mismatch: idx={i} got {sc.shape[0]} expected {n0}")
 
     normed: List[np.ndarray] = []
-    for sc in scores_list:
-        if args.normalize_scores == "none":
-            normed.append(sc.astype(np.float32, copy=False))
-        elif args.normalize_scores == "zscore":
-            normed.append(_zscore(sc))
-        elif args.normalize_scores == "rank":
-            normed.append(_rank01(sc))
-        else:
-            raise ValueError("Unknown normalize_scores")
+    z_stats = None
+    if args.normalize_scores == "zscore" and args.zscore_cal_split != "none":
+        split = args.zscore_cal_split
+        if split not in dataset:
+            raise ValueError(f"zscore_cal_split={split} not found in dataset.")
+        ds_cal = dataset[split]
+        cal_idx = _get_normal_indices(ds_cal, normal_label=args.zscore_normal_label)
+        if not cal_idx:
+            logger.warning("No normal samples for zscore calibration; using full split.")
+            cal_idx = list(range(len(ds_cal)))
+
+        z_stats = []
+        for ckpt_path, ckpt_name in zip(args.checkpoints, ckpt_names):
+            cal_scores = _load_or_compute_scores_for_indices(
+                ckpt_path=ckpt_path,
+                ckpt_name=ckpt_name,
+                split_tag=f"zcal_{split}",
+                dataset_split=ds_cal,
+                indices=cal_idx,
+                model_args=model_args,
+                ref_args=ref_args,
+                device=device,
+                save_scores_dir=args.save_scores_dir,
+                force_recompute=args.force_recompute,
+            )
+            mu = float(np.mean(cal_scores)) if cal_scores.size else 0.0
+            sd = float(np.std(cal_scores)) if cal_scores.size else 1.0
+            z_stats.append({"mean": mu, "std": sd, "n": int(cal_scores.size)})
+
+        for sc, st in zip(scores_list, z_stats):
+            normed.append(_zscore_with_stats(sc, st["mean"], st["std"]))
+    else:
+        for sc in scores_list:
+            if args.normalize_scores == "none":
+                normed.append(sc.astype(np.float32, copy=False))
+            elif args.normalize_scores == "zscore":
+                normed.append(_zscore(sc))
+            elif args.normalize_scores == "rank":
+                normed.append(_rank01(sc))
+            else:
+                raise ValueError("Unknown normalize_scores")
 
     k_models = len(normed)
     logger.info("Ensembling K=%d models, N=%d samples, norm=%s", k_models, n0, args.normalize_scores)
@@ -470,35 +595,18 @@ def main():
 
         cal_scores_list = []
         for ckpt_path, ckpt_name in zip(args.checkpoints, ckpt_names):
-            cal_cache = None
-            if args.save_scores_dir is not None:
-                cal_cache = args.save_scores_dir / f"{ckpt_name}.cal_{cal_split}.npy"
-            if cal_cache is not None and cal_cache.exists() and not args.force_recompute:
-                logger.info("Loading cached cal scores: %s", cal_cache)
-                cal_scores = np.load(cal_cache)
-            else:
-                logger.info("Loading checkpoint for cal: %s", ckpt_path)
-                state = _load_ckpt_state(ckpt_path)
-                model = STG_NF(**model_args)
-                model.load_state_dict(state, strict=False)
-                if hasattr(model, "set_actnorm_init"):
-                    model.set_actnorm_init()
-                model.to(device)
-                cal_scores = _extract_normality_scores_indexed(
-                    model=model,
-                    dataset=ds_cal,
-                    indices=cal_idx,
-                    ref_args=ref_args,
-                    device=device,
-                    batch_size=getattr(ref_args, "batch_size", 256),
-                    num_workers=getattr(ref_args, "num_workers", 4),
-                )
-                if cal_cache is not None:
-                    np.save(cal_cache, cal_scores)
-                    logger.info("Saved cached cal scores: %s", cal_cache)
-                del model
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+            cal_scores = _load_or_compute_scores_for_indices(
+                ckpt_path=ckpt_path,
+                ckpt_name=ckpt_name,
+                split_tag=f"pcal_{cal_split}",
+                dataset_split=ds_cal,
+                indices=cal_idx,
+                model_args=model_args,
+                ref_args=ref_args,
+                device=device,
+                save_scores_dir=args.save_scores_dir,
+                force_recompute=args.force_recompute,
+            )
             cal_scores_list.append(cal_scores.astype(np.float32, copy=False))
 
         p_list = []
@@ -515,10 +623,25 @@ def main():
         anom_stouffer = _stouffer_combine(p_stack)
         anom_min = _min_combine(p_stack)
 
+        if args.pvalue_weights is not None:
+            w = np.asarray(args.pvalue_weights, dtype=np.float32)
+            if w.size != k_models:
+                raise ValueError(f"--pvalue_weights must have length K={k_models}")
+        elif best_alphas is not None:
+            w = np.asarray(best_alphas, dtype=np.float32)
+        else:
+            w = np.ones((k_models,), dtype=np.float32) / float(k_models)
+
+        anom_fisher_w = _fisher_combine_weighted(p_stack, w)
+        anom_stouffer_w = _stouffer_combine_weighted(p_stack, w)
+
         pvalue_ensembles = {
             "pvalue_fisher": _compute_metrics_from_normality_scores(-anom_fisher, test_metadata, ref_args, args.f1_threshold),
             "pvalue_stouffer": _compute_metrics_from_normality_scores(-anom_stouffer, test_metadata, ref_args, args.f1_threshold),
             "pvalue_min": _compute_metrics_from_normality_scores(-anom_min, test_metadata, ref_args, args.f1_threshold),
+            "pvalue_fisher_weighted": _compute_metrics_from_normality_scores(-anom_fisher_w, test_metadata, ref_args, args.f1_threshold),
+            "pvalue_stouffer_weighted": _compute_metrics_from_normality_scores(-anom_stouffer_w, test_metadata, ref_args, args.f1_threshold),
+            "pvalue_weights_used": w.tolist(),
         }
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -536,6 +659,10 @@ def main():
         "pvalue_tail": args.pvalue_tail,
         "pvalue_cal_split": args.pvalue_cal_split,
         "pvalue_normal_label": int(args.pvalue_normal_label),
+        "pvalue_weights": args.pvalue_weights,
+        "zscore_cal_split": args.zscore_cal_split,
+        "zscore_normal_label": int(args.zscore_normal_label),
+        "zscore_calibration_stats": z_stats,
         "best_alphas": best_alphas,
         "best_metrics": best_metrics,
         "logs": logs,

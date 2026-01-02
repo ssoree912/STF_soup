@@ -8,6 +8,7 @@ from typing import Dict, List
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if PROJECT_ROOT not in sys.path:
@@ -16,8 +17,11 @@ if PROJECT_ROOT not in sys.path:
 from args import init_parser, init_sub_args
 from dataset import get_dataset_and_loader
 from utils.data_utils import trans_list
+from utils.scoring_utils import get_dataset_scores, smooth_scores
 from utils.unlearning_utils import (
     load_model_from_checkpoint,
+    prepare_batch,
+    reduce_conf_score,
     select_df1_tail,
     select_df2_dynamics_v2,
     select_df2_val_fp_train_df,
@@ -76,6 +80,117 @@ def sb_stats(sb_map: Dict[int, float], sids: List[int], tau_base: float) -> Dict
         "max": float(qs[4]),
         "frac_ge_tau_base": float(frac_ge_tau),
     }
+
+@torch.no_grad()
+def infer_normality_scores_dataset(
+    model,
+    dataset,
+    device: torch.device,
+    model_confidence: bool,
+    batch_size: int,
+    num_workers: int,
+    use_conf_score: bool,
+) -> np.ndarray:
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    model.eval()
+    scores = []
+    for batch in loader:
+        x, score, label = prepare_batch(batch, device, model_confidence)
+        _, nll = model(x, label=label)
+        if use_conf_score:
+            nll = nll * reduce_conf_score(score)
+        scores.append((-1.0 * nll).detach().cpu())
+    if not scores:
+        return np.zeros((0,), dtype=np.float32)
+    return torch.cat(scores, dim=0).view(-1).numpy().astype(np.float32, copy=False)
+
+
+def _frame_scores_and_gt(normality_scores: np.ndarray, metadata, ref_args):
+    gt_arr, scores_arr = get_dataset_scores(normality_scores, metadata, args=ref_args)
+    scores_arr = smooth_scores(scores_arr)
+    gt_np = np.concatenate(gt_arr) if len(gt_arr) else np.zeros((0,), dtype=np.int64)
+    sc_np = np.concatenate(scores_arr) if len(scores_arr) else np.zeros((0,), dtype=np.float32)
+    if sc_np.size:
+        if np.isposinf(sc_np).any():
+            sc_np[np.isposinf(sc_np)] = np.max(sc_np[~np.isposinf(sc_np)])
+        if np.isneginf(sc_np).any():
+            sc_np[np.isneginf(sc_np)] = np.min(sc_np[~np.isneginf(sc_np)])
+    return gt_np, sc_np
+
+
+def _pairwise_corr(scores_by_model: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
+    keys = list(scores_by_model.keys())
+    if not keys:
+        return {}
+    mats = {k: np.asarray(scores_by_model[k]) for k in keys}
+    mask = np.ones_like(mats[keys[0]], dtype=bool)
+    for k in keys:
+        mask &= np.isfinite(mats[k])
+    out = {}
+    for a in keys:
+        out[a] = {}
+        xa = mats[a][mask]
+        for b in keys:
+            xb = mats[b][mask]
+            if xa.size == 0 or xb.size == 0:
+                out[a][b] = float("nan")
+                continue
+            out[a][b] = float(np.corrcoef(xa, xb)[0, 1])
+    return out
+
+
+def _pairwise_spearman(scores_by_model: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
+    from scipy.stats import spearmanr
+    keys = list(scores_by_model.keys())
+    if not keys:
+        return {}
+    mats = {k: np.asarray(scores_by_model[k]) for k in keys}
+    mask = np.ones_like(mats[keys[0]], dtype=bool)
+    for k in keys:
+        mask &= np.isfinite(mats[k])
+    out = {}
+    for a in keys:
+        out[a] = {}
+        xa = mats[a][mask]
+        for b in keys:
+            xb = mats[b][mask]
+            if xa.size == 0 or xb.size == 0:
+                out[a][b] = float("nan")
+                continue
+            out[a][b] = float(spearmanr(xa, xb).correlation)
+    return out
+
+
+def _anomaly_top_jaccard(scores_by_model: Dict[str, np.ndarray], gt_np: np.ndarray, top_pct: float):
+    keys = list(scores_by_model.keys())
+    out = {}
+    if gt_np.size == 0:
+        return out, {}
+    ab_idx = np.where(gt_np == 0)[0]
+    if ab_idx.size == 0:
+        return out, {}
+    frac = max(0.0, min(100.0, float(top_pct))) / 100.0
+    k = max(1, int(len(ab_idx) * frac))
+
+    sets = {}
+    for kname in keys:
+        s = scores_by_model[kname][ab_idx]
+        order = np.argsort(s)  # low normality => more anomalous
+        top_ids = ab_idx[order[:k]]
+        sets[kname] = set(map(int, top_ids))
+
+    for a in keys:
+        out[a] = {}
+        A = sets[a]
+        for b in keys:
+            B = sets[b]
+            if len(A) == 0 or len(B) == 0:
+                out[a][b] = 0.0
+                continue
+            inter = len(A & B)
+            union = len(A | B)
+            out[a][b] = float(inter / max(1, union))
+    return out, {kname: len(sets[kname]) for kname in keys}
 
 
 def overlap_table(df_sets: Dict[str, List[int]]) -> Dict[str, Dict[str, float]]:
@@ -172,6 +287,11 @@ def parse_args():
 
     p.add_argument("--dump_sids", action="store_true")
     p.add_argument("--dump_format", type=str, default="pkl", choices=["pkl", "txt"])
+    p.add_argument("--diversity_checkpoints", nargs="+", default=None,
+                   help="ckpt paths for score diversity check")
+    p.add_argument("--diversity_top_pct", type=float, default=1.0,
+                   help="top %% among anomaly frames for Jaccard (default 1.0)")
+    p.add_argument("--diversity_batch_size", type=int, default=None)
     return p.parse_args()
 
 
@@ -397,6 +517,54 @@ def main():
             if cont[b][a] >= overlap_warn_c:
                 warnings.append(f"High containment: {b} in {a} = {cont[b][a]:.3f}")
 
+    diversity = None
+    if args.diversity_checkpoints:
+        if dataset.get("test") is None:
+            raise ValueError("diversity_checkpoints requires test split.")
+        ds_test = dataset["test"]
+        test_metadata = ds_test.metadata
+        batch_size = int(args.diversity_batch_size or args.batch_size)
+        use_conf_score = bool(args.model_confidence)
+
+        scores_by_model = {}
+        gt_np = None
+        for ckpt in args.diversity_checkpoints:
+            model = load_model_from_checkpoint(args, dataset, ckpt).to(device)
+            scores = infer_normality_scores_dataset(
+                model=model,
+                dataset=ds_test,
+                device=device,
+                model_confidence=bool(args.model_confidence),
+                batch_size=batch_size,
+                num_workers=int(args.num_workers),
+                use_conf_score=use_conf_score,
+            )
+            name = os.path.basename(ckpt)
+            gt_here, frame_scores = _frame_scores_and_gt(scores, test_metadata, args)
+            if gt_np is None:
+                gt_np = gt_here
+            scores_by_model[name] = frame_scores
+
+        pearson = _pairwise_corr(scores_by_model)
+        spearman = _pairwise_spearman(scores_by_model)
+        jaccard, counts = _anomaly_top_jaccard(scores_by_model, gt_np, top_pct=args.diversity_top_pct)
+        diversity = {
+            "pearson": pearson,
+            "spearman": spearman,
+            "anomaly_top_pct": float(args.diversity_top_pct),
+            "anomaly_top_jaccard": jaccard,
+            "anomaly_top_counts": counts,
+        }
+
+        for a in pearson:
+            for b in pearson[a]:
+                if a != b and pearson[a][b] >= 0.98:
+                    warnings.append(f"High score correlation (pearson): {a} vs {b} = {pearson[a][b]:.3f}")
+        for a in jaccard:
+            for b in jaccard[a]:
+                if a != b and jaccard[a][b] >= 0.8:
+                    warnings.append(f"High anomaly Jaccard: {a} vs {b} = {jaccard[a][b]:.3f}")
+
     report = {
         "meta": {
             "val_split": val_split,
@@ -415,6 +583,7 @@ def main():
             "jaccard": jac,
             "containment": cont,
         },
+        "diversity": diversity,
         "warnings": warnings,
     }
 
