@@ -6,6 +6,7 @@ from typing import Iterable, List, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from models.STG_NF.model_pose import STG_NF
@@ -890,3 +891,122 @@ def retrain_on_dr(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
     return model
+
+
+def freeze_all_then_unfreeze(
+    model: torch.nn.Module,
+    include_regex: Optional[str] = None,
+    exclude_regex: Optional[str] = None,
+) -> None:
+    # freeze all
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+    # _select_named_params only sees trainable params, so temporarily enable for selection.
+    for _, p in model.named_parameters():
+        p.requires_grad = True
+    params = _select_named_params(model, include_regex=include_regex, exclude_regex=exclude_regex)
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+    if not params:
+        raise ValueError(f"No params matched include_regex={include_regex} exclude_regex={exclude_regex}")
+    for _, p in params:
+        p.requires_grad = True
+
+
+def build_optimizer_trainable(model: torch.nn.Module, lr: float) -> torch.optim.Optimizer:
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if not trainable:
+        raise ValueError("No trainable parameters. (All frozen?)")
+    return torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
+
+
+@torch.no_grad()
+def snapshot_params(
+    model: torch.nn.Module,
+    include_regex: Optional[str] = None,
+    exclude_regex: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    snap = {}
+    for name, p in _select_named_params(model, include_regex=include_regex, exclude_regex=exclude_regex):
+        snap[name] = p.detach().clone().cpu()
+    return snap
+
+
+def compute_fisher_diag(
+    model: torch.nn.Module,
+    loader,
+    device: torch.device,
+    model_confidence: bool,
+    use_conf_score: bool,
+    prepare_batch_fn,
+    reduce_conf_score_fn,
+    include_regex: Optional[str] = None,
+    exclude_regex: Optional[str] = None,
+    max_batches: int = 200,
+) -> Dict[str, torch.Tensor]:
+    """
+    Fisher diag ~ E[g^2] on RETAIN batches.
+    """
+    params = _select_named_params(model, include_regex=include_regex, exclude_regex=exclude_regex)
+    if not params:
+        return {}
+
+    fisher = {n: torch.zeros_like(p.detach(), device="cpu") for n, p in params}
+
+    was_training = model.training
+    model.train()
+
+    it = iter(loader)
+    n = 0
+    for _ in range(max_batches):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        x, score, label = prepare_batch_fn(batch, device, model_confidence)
+        _, nll = model(x, label=label)
+        if use_conf_score:
+            nll = nll * reduce_conf_score_fn(score)
+        loss = nll.mean()
+
+        model.zero_grad(set_to_none=True)
+        loss.backward()
+
+        for name, p in params:
+            if p.grad is None:
+                continue
+            fisher[name] += (p.grad.detach().cpu() ** 2)
+        n += 1
+
+    if n > 0:
+        for k in fisher:
+            fisher[k] /= float(n)
+
+    if not was_training:
+        model.eval()
+    return fisher
+
+
+def ewc_penalty(
+    model: torch.nn.Module,
+    base_snap: Dict[str, torch.Tensor],
+    fisher: Dict[str, torch.Tensor],
+    include_regex: Optional[str] = None,
+    exclude_regex: Optional[str] = None,
+) -> torch.Tensor:
+    if not fisher:
+        return torch.tensor(0.0, device=next(model.parameters()).device)
+
+    pen = 0.0
+    device = next(model.parameters()).device
+    for name, p in _select_named_params(model, include_regex=include_regex, exclude_regex=exclude_regex):
+        if name not in fisher or name not in base_snap:
+            continue
+        diff = p - base_snap[name].to(device)
+        pen = pen + (fisher[name].to(device) * diff * diff).sum()
+    return pen
+
+
+def distill_nll_mse(student_nll: torch.Tensor, teacher_nll: torch.Tensor) -> torch.Tensor:
+    # flow는 logits distill이 애매하니 NLL regression이 안전함
+    return F.mse_loss(student_nll, teacher_nll)

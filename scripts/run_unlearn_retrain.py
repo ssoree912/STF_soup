@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import math
 import json
 import os
@@ -13,14 +14,20 @@ if PROJECT_ROOT not in sys.path:
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from args import init_parser, init_sub_args
 from dataset import get_dataset_and_loader
 from models.STG_NF.modules_pose import gaussian_likelihood, gaussian_p
 from utils.data_utils import trans_list
 from utils.unlearning_utils import (
+    build_optimizer_trainable,
     build_indexed_loader,
+    compute_fisher_diag,
+    distill_nll_mse,
+    ewc_penalty,
     eval_nll_on_indices,
+    freeze_all_then_unfreeze,
     load_model_from_checkpoint,
     prepare_batch,
     reduce_conf_score,
@@ -29,6 +36,7 @@ from utils.unlearning_utils import (
     select_df2_val_fp_train_df,
     select_df3_grad_alignment_train_df,
     select_df3_subdomain_train_df,
+    snapshot_params,
 )
 from utils.scoring_utils import score_dataset
 
@@ -384,6 +392,17 @@ def parse_args():
     parser.add_argument("--epochs_retrain", type=int, default=2)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
+    # ---- Unlearn objective (remain-aware / SCRUB / SLUG / EWC) ----
+    parser.add_argument("--lambda_forget", type=float, default=1.0)
+    parser.add_argument("--lambda_retain", type=float, default=0.0)
+    parser.add_argument("--lambda_distill", type=float, default=0.0)
+    parser.add_argument("--lambda_ewc", type=float, default=0.0)
+    parser.add_argument("--ewc_max_batches", type=int, default=200)
+
+    # SLUG: update only selected params during UNLEARN
+    parser.add_argument("--unlearn_include_regex", type=str, default="")
+    parser.add_argument("--unlearn_exclude_regex", type=str, default="")
+
     # DF dump
     parser.add_argument("--dump_df_sids", action="store_true")
     parser.add_argument("--dump_df_format", type=str, default="pkl", choices=["pkl", "txt"])
@@ -543,6 +562,19 @@ def main():
         else:
             raise ValueError(f"Unsupported df_name={args.df_name}")
 
+        # ----- DF별 권장 기본값 (원하면 주석 처리 가능) -----
+        if args.df_name == "df2" and args.df2_unlearn_loss != "nll":
+            print("[INFO] DF2: forcing df2_unlearn_loss=nll for safer unlearning objective.")
+            args.df2_unlearn_loss = "nll"
+
+        if args.df_name == "df3" and args.df3_unlearn_loss != "nll":
+            print("[INFO] DF3: forcing df3_unlearn_loss=nll for safer unlearning objective.")
+            args.df3_unlearn_loss = "nll"
+
+        if args.df_name in ("df2p", "df3p") and not args.unlearn_include_regex.strip():
+            args.unlearn_include_regex = "prior"
+            print("[INFO] SLUG default: unlearn_include_regex='prior'")
+
         if not df_sids:
             raise ValueError(f"{args.df_name} selected empty set. df_info={df_info}")
     else:
@@ -588,34 +620,122 @@ def main():
             "sid_to_cluster": df3_cluster_ctx_np["sid_to_cluster"],
         }
 
+    # ---- retain loader: remain-aware / distill / fisher는 retain에서 계산 ----
+    retain_loader = dr_loader
+    retain_it = iter(retain_loader)
+    df_it = iter(df_loader)
+
+    # ---- SLUG: freeze/unfreeze (UNLEARN stage only) ----
+    include_rgx = args.unlearn_include_regex.strip() or None
+    exclude_rgx = args.unlearn_exclude_regex.strip() or None
+    if include_rgx is not None:
+        freeze_all_then_unfreeze(model, include_regex=include_rgx, exclude_regex=exclude_rgx)
+
+    # optimizer는 "trainable만"
+    opt = build_optimizer_trainable(model, args.lr_unlearn)
+
+    # ---- SCRUB: teacher snapshot (retain distill) ----
+    teacher = None
+    if args.lambda_distill > 0:
+        teacher = copy.deepcopy(model).to(device)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+
+    # ---- Fisher/EWC 준비: retain에서 fisher diag 추정 ----
+    base_snap = None
+    fisher = None
+    if args.lambda_ewc > 0:
+        base_snap = snapshot_params(model, include_regex=include_rgx, exclude_regex=exclude_rgx)
+        fisher = compute_fisher_diag(
+            model=model,
+            loader=retain_loader,
+            device=device,
+            model_confidence=args.model_confidence,
+            use_conf_score=use_conf_score_train,
+            prepare_batch_fn=prepare_batch,
+            reduce_conf_score_fn=reduce_conf_score,
+            include_regex=include_rgx,
+            exclude_regex=exclude_rgx,
+            max_batches=int(args.ewc_max_batches),
+        )
+        model.train()
+
     # -----------------------
-    # UNLEARN (GA on DF)
+    # UNLEARN (DF + retain-aware + optional distill/EWC)
     # -----------------------
     model.train()
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr_unlearn, weight_decay=0.0)
-
-    it = iter(df_loader)
     eval_history = []
     steps_ran = 0
 
     for step in range(args.steps_unlearn):
+        # DF batch
         try:
-            batch = next(it)
+            batch_df = next(df_it)
         except StopIteration:
-            it = iter(df_loader)
-            batch = next(it)
+            df_it = iter(df_loader)
+            batch_df = next(df_it)
 
-        x, score, label = prepare_batch(batch, device, args.model_confidence)
-        z, logdet, mean, logs, nll, denom = forward_nll_components(model, x, label)
-        batch_sids = batch[1].tolist() if torch.is_tensor(batch[1]) else list(batch[1])
+        # retain batch
+        try:
+            batch_rt = next(retain_it)
+        except StopIteration:
+            retain_it = iter(retain_loader)
+            batch_rt = next(retain_it)
+
+        # --- FORGET term (maximize "badness") ---
+        x_df, score_df, label_df = prepare_batch(batch_df, device, args.model_confidence)
+        z, logdet, mean, logs, nll_df, denom = forward_nll_components(model, x_df, label_df)
+        batch_sids = batch_df[1].tolist() if torch.is_tensor(batch_df[1]) else list(batch_df[1])
 
         score_val, score_is_nll = compute_unlearn_score(
-            args.df_name, z, logdet, mean, logs, nll, denom, batch_sids, df3_ctx_torch, args
+            args.df_name, z, logdet, mean, logs, nll_df, denom, batch_sids, df3_ctx_torch, args
         )
         if use_conf_score_df and score_is_nll:
-            score_val = score_val * reduce_conf_score(score)
+            score_val = score_val * reduce_conf_score(score_df)
 
-        loss = -score_val.mean()
+        # "지우기": score를 키우는 방향 => loss = -score
+        loss_forget = -score_val.mean()
+
+        # --- RETAIN term (protect) ---
+        loss_retain = torch.tensor(0.0, device=device)
+        loss_distill = torch.tensor(0.0, device=device)
+
+        if args.lambda_retain > 0 or args.lambda_distill > 0:
+            x_rt, score_rt, label_rt = prepare_batch(batch_rt, device, args.model_confidence)
+            _, nll_rt = model(x_rt, label=label_rt)
+            if use_conf_score_train:
+                nll_rt = nll_rt * reduce_conf_score(score_rt)
+
+            if args.lambda_retain > 0:
+                loss_retain = nll_rt.mean()
+
+            if teacher is not None and args.lambda_distill > 0:
+                with torch.no_grad():
+                    _, nll_t = teacher(x_rt, label=label_rt)
+                    if use_conf_score_train:
+                        nll_t = nll_t * reduce_conf_score(score_rt)
+                loss_distill = distill_nll_mse(nll_rt, nll_t)
+
+        # --- EWC penalty ---
+        loss_ewc = torch.tensor(0.0, device=device)
+        if args.lambda_ewc > 0 and base_snap is not None and fisher is not None:
+            loss_ewc = ewc_penalty(
+                model=model,
+                base_snap=base_snap,
+                fisher=fisher,
+                include_regex=include_rgx,
+                exclude_regex=exclude_rgx,
+            )
+
+        # total
+        loss = (
+            args.lambda_forget * loss_forget
+            + args.lambda_retain * loss_retain
+            + args.lambda_distill * loss_distill
+            + args.lambda_ewc * loss_ewc
+        )
+
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -623,6 +743,7 @@ def main():
 
         steps_ran = step + 1
 
+        # safety eval: val FPR blow-up stop
         if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
             val_nll = eval_nll_on_indices(
                 model, val_dataset, val_norm_sids,
@@ -635,6 +756,7 @@ def main():
             fpr_val = float(np.mean(val_nll >= tau_base)) if val_nll.size else 0.0
             eval_history.append({"step": step + 1, "fpr_val": fpr_val})
             if fpr_val > args.fpr_tol * fpr_base:
+                print(f"[STOP] FPR exploded: {fpr_val:.4f} > tol*base")
                 break
 
     unlearn_metrics = compute_single_metrics(
