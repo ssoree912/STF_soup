@@ -280,7 +280,9 @@ def compute_single_metrics(model, train_dataset, val_dataset, df_sids, val_sids,
     out = {
         "df_nll_mean": float(df_nll.mean()) if df_nll.size else 0.0,
         "val_nll_mean": float(val_nll.mean()) if val_nll.size else 0.0,
+        #df 데이터의 nll 변화량
         "delta_df": float(df_nll.mean() - base_df) if df_nll.size else 0.0,
+        #nllcurrr - nllbase : 검증 데이터의 nll 변화량
         "delta_val": float(val_nll.mean() - base_val) if val_nll.size else 0.0,
         "fpr_val": float(np.mean(val_nll >= tau_base)) if val_nll.size else 0.0,
     }

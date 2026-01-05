@@ -245,7 +245,7 @@ def select_df3_subdomain(
     top_clusters: int = 2,
     tau_q: float = 0.999,
 ) -> Tuple[List[int], Dict[str, object]]:
-    s_val = np.array([cache["sB"][sid] for sid in val_sids], dtype=np.float32)
+    s_val = np.array([cache["sB"][sid] for sid in val_sids], dtype=np.float32) # sB(검증 데이터의 이상치 점수
     tau_base = float(np.quantile(s_val, tau_q)) #sB(데이터들의 이상치점수)를 확인하여 상위%에 해당하는 컷오프 
 
     X, kept = [], []
@@ -265,18 +265,18 @@ def select_df3_subdomain(
 
     clusters = {k: [] for k in range(k_clusters)}
     for sid, lab in zip(kept, labels):
-        clusters[int(lab)].append(sid)
+        clusters[int(lab)].append(sid) #각 클러스터에 속한 샘플 ID 저장
 
     rates = []
     for k in range(k_clusters):
-        ss = clusters[k]
+        ss = clusters[k] #클러스터 k에 속한 샘플들
         if not ss:
             continue
         r = float(np.mean([cache["sB"][sid] >= tau_base for sid in ss]))
         rates.append((k, r, len(ss)))
 
-    rates.sort(key=lambda x: x[1], reverse=True)
-    bad = [k for k, _, _ in rates[:top_clusters]]
+    rates.sort(key=lambda x: x[1], reverse=True) #이상치 비율 기준 내림차순 정렬
+    bad = [k for k, _, _ in rates[:top_clusters]] #상위 top_clusters 개의 클러스터 선택
 
     df3 = []
     for k in bad:
@@ -561,7 +561,7 @@ def _select_named_params(
             )
     return params
 
-
+#val 정상 평균 그래디언트 
 def _accumulate_mean_grads(
     model: STG_NF,
     loader: DataLoader,
@@ -590,6 +590,7 @@ def _accumulate_mean_grads(
         _, nll = model(x, label=label)
         if use_conf_score:
             nll = nll * reduce_conf_score(score)
+        #val 정상 샘플 일부를 뽑아 여러 배치에 대해 
         loss = nll.mean()
 
         model.zero_grad(set_to_none=True)
@@ -642,8 +643,9 @@ def select_df3_grad_alignment_train_df(
         val_dataset, val_norm, batch_size=batch_size, num_workers=num_workers, shuffle=True
     )
     max_batches = max_val_batches
-    if max_batches <= 0:
+    if max_batches <= 0: 
         max_batches = math.ceil(len(val_norm) / max(1, batch_size))
+    #val 정상 샘플에 대한 평균 그래디언트 계산
     g_val = _accumulate_mean_grads(
         base_model,
         val_loader,
@@ -671,7 +673,7 @@ def select_df3_grad_alignment_train_df(
 
     scores = []
     base_model.train()
-    for batch in train_loader:
+    for batch in train_loader: 
         sid = batch[1]
         if torch.is_tensor(sid):
             sid = int(sid.item()) if sid.numel() == 1 else int(sid[0].item())
@@ -688,14 +690,16 @@ def select_df3_grad_alignment_train_df(
 
         base_model.zero_grad(set_to_none=True)
         loss.backward()
-
+        #내적 계산
         align = 0.0
         for name, p in params:
+            #p.grad : 이 학습 데이터가 원하는 방향
             if p.grad is None:
                 continue
-            gv = g_val.get(name, None)
+            gv = g_val.get(name, None) #검증 데이터가 원하는 방향
             if gv is None:
                 continue
+            #두 벡터를 곱해서(내적) 더함
             align += float((p.grad.detach().cpu() * gv).sum().item())
         scores.append((sid, align))
 
