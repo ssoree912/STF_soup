@@ -554,6 +554,8 @@ def main():
     else:
         grid_values = list(args.grid_values)
         logger.info("Grid search values=%s normalize=%s select_by=%s", grid_values, args.grid_normalize, args.select_by)
+        alpha_key_precision = 8
+        seen_alphas = set()
 
         for combo in itertools.product(grid_values, repeat=k_models):
             combo = list(combo)
@@ -566,6 +568,12 @@ def main():
                 alphas = combo
                 if sum(alphas) == 0:
                     continue
+
+            # Avoid duplicate alpha vectors (e.g., scaled combos that normalize to the same weights).
+            key = tuple(round(float(a), alpha_key_precision) for a in alphas)
+            if key in seen_alphas:
+                continue
+            seen_alphas.add(key)
 
             metrics = eval_alphas(alphas)
             logs.append({"alphas": alphas, "metrics": metrics})

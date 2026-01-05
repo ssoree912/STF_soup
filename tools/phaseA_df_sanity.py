@@ -40,6 +40,19 @@ def sample_val_sids(all_sids, ratio, seed):
     return rng.sample(list(all_sids), count)
 
 
+def _parse_list_arg(values):
+    if not values:
+        return None
+    if len(values) == 1 and "," in values[0]:
+        return [v.strip() for v in values[0].split(",") if v.strip()]
+    return list(values)
+
+
+def _load_cache(path: str) -> dict:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 def filter_normals(dataset, sids, normal_label=1):
     out = []
     if dataset is None:
@@ -59,6 +72,42 @@ def filter_normals(dataset, sids, normal_label=1):
         if label == int(normal_label):
             out.append(int(sid))
     return out
+
+
+def compute_tau_fpr(
+    cache_val: dict,
+    val_dataset,
+    val_ratio: float,
+    val_seed: int,
+    tau_q: float,
+    tau_from_all_val: bool,
+    normal_label: int,
+):
+    val_candidates = sorted(cache_val["sB"].keys())
+    val_sids = sample_val_sids(val_candidates, val_ratio, val_seed)
+
+    val_norm_sids = filter_normals(val_dataset, val_sids, normal_label=normal_label)
+    val_norm_sids = [sid for sid in val_norm_sids if int(sid) in cache_val["sB"]]
+    if not val_norm_sids:
+        val_norm_sids = [sid for sid in val_sids if int(sid) in cache_val["sB"]]
+
+    val_norm_candidates = filter_normals(val_dataset, val_candidates, normal_label=normal_label)
+    val_norm_candidates = [sid for sid in val_norm_candidates if int(sid) in cache_val["sB"]]
+    if not val_norm_candidates:
+        val_norm_candidates = [sid for sid in val_candidates if int(sid) in cache_val["sB"]]
+
+    if tau_from_all_val:
+        s_val = np.array([cache_val["sB"][sid] for sid in val_norm_candidates], dtype=np.float32)
+    else:
+        s_val = np.array([cache_val["sB"][sid] for sid in val_norm_sids], dtype=np.float32)
+    tau_base = float(np.quantile(s_val, tau_q)) if s_val.size else 0.0
+
+    s_val_monitor = np.array([cache_val["sB"][sid] for sid in val_norm_sids], dtype=np.float32)
+    fpr_base = float(np.mean(s_val_monitor >= tau_base)) if s_val_monitor.size else 0.0
+    if val_norm_sids:
+        fpr_base = max(fpr_base, 1.0 / max(1, len(val_norm_sids)))
+
+    return tau_base, fpr_base, val_sids, val_norm_sids, val_norm_candidates
 
 
 def sb_stats(sb_map: Dict[int, float], sids: List[int], tau_base: float) -> Dict[str, float]:
@@ -249,6 +298,18 @@ def parse_args():
         help="paths to pkl/txt with DF sids; if set, load these instead of selecting",
     )
     p.add_argument(
+        "--df_cache_train_paths",
+        nargs="+",
+        default=None,
+        help="optional per-DF train cache paths (same order as --df_paths)",
+    )
+    p.add_argument(
+        "--df_cache_val_paths",
+        nargs="+",
+        default=None,
+        help="optional per-DF val cache paths (same order as --df_paths)",
+    )
+    p.add_argument(
         "--df_names",
         type=str,
         default=None,
@@ -321,37 +382,37 @@ def main():
     train_dataset = dataset["train"]
     val_dataset = dataset["test"] if val_split == "test" else dataset["train"]
 
-    val_sids = sample_val_sids(val_candidates, args.val_ratio, args.val_seed)
-    val_norm_sids = filter_normals(val_dataset, val_sids, normal_label=args.normal_label)
-    if not val_norm_sids:
-        val_norm_sids = list(val_sids)
-
-    val_norm_candidates = filter_normals(val_dataset, val_candidates, normal_label=args.normal_label)
-    if not val_norm_candidates:
-        val_norm_candidates = list(val_candidates)
-
-    if args.tau_from_all_val:
-        s_val_all = np.array([cache_val["sB"][sid] for sid in val_norm_candidates], dtype=np.float32)
-        tau_base = float(np.quantile(s_val_all, args.tau_q))
-    else:
-        s_val_sub = np.array([cache_val["sB"][sid] for sid in val_norm_sids], dtype=np.float32)
-        tau_base = float(np.quantile(s_val_sub, args.tau_q))
-
-    s_val_monitor = np.array([cache_val["sB"][sid] for sid in val_norm_sids], dtype=np.float32)
-    fpr_base = float(np.mean(s_val_monitor >= tau_base))
-    fpr_base = max(fpr_base, 1.0 / max(1, len(val_norm_sids)))
+    tau_base, fpr_base, val_sids, val_norm_sids, val_norm_candidates = compute_tau_fpr(
+        cache_val=cache_val,
+        val_dataset=val_dataset,
+        val_ratio=float(args.val_ratio),
+        val_seed=int(args.val_seed),
+        tau_q=float(args.tau_q),
+        tau_from_all_val=bool(args.tau_from_all_val),
+        normal_label=int(args.normal_label),
+    )
 
     device = torch.device(args.device)
 
     df_sets: Dict[str, List[int]] = {}
     df_infos: Dict[str, Dict] = {}
     warnings = []
+    df_cache_train_map = {}
+    df_tau_map = {}
+    df_cache_train_paths = None
+    df_cache_val_paths = None
 
     df_list = [x.strip() for x in args.df_list.split(",") if x.strip()]
     if args.df_paths:
-        paths = args.df_paths
-        if len(paths) == 1 and "," in paths[0]:
-            paths = [p.strip() for p in paths[0].split(",") if p.strip()]
+        paths = _parse_list_arg(args.df_paths)
+        df_cache_train_paths = _parse_list_arg(args.df_cache_train_paths)
+        df_cache_val_paths = _parse_list_arg(args.df_cache_val_paths)
+
+        if df_cache_train_paths and len(df_cache_train_paths) != len(paths):
+            raise ValueError("--df_cache_train_paths length must match --df_paths length.")
+        if df_cache_val_paths and len(df_cache_val_paths) != len(paths):
+            raise ValueError("--df_cache_val_paths length must match --df_paths length.")
+
         if args.df_names:
             names = [n.strip() for n in args.df_names.split(",") if n.strip()]
         else:
@@ -360,7 +421,7 @@ def main():
             raise ValueError("--df_names length must match --df_paths length.")
 
         df_list = list(names)
-        for name, path in zip(names, paths):
+        for idx, (name, path) in enumerate(zip(names, paths)):
             if path.endswith(".pkl"):
                 with open(path, "rb") as f:
                     df = pickle.load(f)
@@ -371,7 +432,34 @@ def main():
                 raise ValueError(f"Unsupported DF file: {path}")
             df = sorted(list(set(map(int, df))))
             df_sets[name] = df
-            df_infos[name] = {"source": path}
+
+            train_path = df_cache_train_paths[idx] if df_cache_train_paths else None
+            val_path = df_cache_val_paths[idx] if df_cache_val_paths else None
+            cache_train_i = _load_cache(train_path) if train_path else cache_train
+            cache_val_i = _load_cache(val_path) if val_path else cache_val
+
+            if val_path:
+                tau_i, fpr_i, _, _, _ = compute_tau_fpr(
+                    cache_val=cache_val_i,
+                    val_dataset=val_dataset,
+                    val_ratio=float(args.val_ratio),
+                    val_seed=int(args.val_seed),
+                    tau_q=float(args.tau_q),
+                    tau_from_all_val=bool(args.tau_from_all_val),
+                    normal_label=int(args.normal_label),
+                )
+            else:
+                tau_i, fpr_i = tau_base, fpr_base
+
+            df_cache_train_map[name] = cache_train_i
+            df_tau_map[name] = tau_i
+            df_infos[name] = {
+                "source": path,
+                "cache_train_path": train_path,
+                "cache_val_path": val_path,
+                "tau_base": float(tau_i),
+                "fpr_base": float(fpr_i),
+            }
     else:
         need_model = ("df3p" in df_list)
         model = None
@@ -486,9 +574,11 @@ def main():
 
     per_df_stats = {}
     for name, sids in df_sets.items():
+        cache_train_i = df_cache_train_map.get(name, cache_train)
+        tau_i = df_tau_map.get(name, tau_base)
         per_df_stats[name] = {
             "size": int(len(sids)),
-            "sB_stats_train": sb_stats(cache_train["sB"], sids, tau_base=tau_base),
+            "sB_stats_train": sb_stats(cache_train_i["sB"], sids, tau_base=tau_i),
         }
 
     if "df1" in per_df_stats and "df2p" in per_df_stats:
@@ -576,6 +666,8 @@ def main():
             "tau_base": float(tau_base),
             "fpr_base": float(fpr_base),
             "df_list": df_list,
+            "df_cache_train_paths": df_cache_train_paths,
+            "df_cache_val_paths": df_cache_val_paths,
         },
         "df_info": df_infos,
         "df_stats": per_df_stats,

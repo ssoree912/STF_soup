@@ -35,7 +35,7 @@ def set_seed(seed: int) -> None:
 def build_indexed_loader(
     dataset: Dataset,
     indices: Iterable[int],
-    batch_size: int,
+    batch_size: int, 
     num_workers: int = 0,
     shuffle: bool = False,
 ) -> DataLoader:
@@ -84,9 +84,9 @@ def extract_steps_and_emb(
     x: torch.Tensor,
     label: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    z, logdet = model.flow(x, reverse=False)
+    z, logdet = model.flow(x, reverse=False) #logdet : flow 모델을 통과하면서 발생한 공간의 부피 변화량, 
     mean, logs = model.prior(x, label) 
-    objective = logdet + gaussian_likelihood(mean, logs, z) #
+    objective = logdet + gaussian_likelihood(mean, logs, z) #logp + logdet
     denom = math.log(2.0) * x.size(1) * x.size(2) * x.size(3) 
     nll_clip = (-objective) / denom #전체 클립의 NLL. 높을 수록 이 데이터를 이상하다고 판단(DF1에서 tail)
 
@@ -143,7 +143,7 @@ def build_base_cache(
     }
 
 # nll_clip 기준 상위 alpha 비율 선택 : 학습에 방해되는 노이즈 제거용
-#sB 값 기준 내림차순
+#sB 값 기준 내림차순(nll score 가 높은것)
 def select_df1_tail(sB: Dict[int, float], alpha: float = 0.01) -> List[int]:
     items = sorted(sB.items(), key=lambda kv: kv[1], reverse=True)
     k = max(1, int(len(items) * alpha))
@@ -160,20 +160,20 @@ def dynamics_metric_from_nll(nll_steps: np.ndarray) -> float:
     return float(dn.mean())
 
 # z_steps 또는 nll_steps 기준 상위 alpha_g 비율 선택 : 동적 변화가 큰 데이터 선택용
-def select_df2_dynamics(cache: Dict[str, Dict[int, np.ndarray]], alpha_g: float = 0.02) -> List[int]:
-    scores = []
-    if cache.get("z_steps"):
-        for sid, zst in cache["z_steps"].items():
-            scores.append((sid, dynamics_metric_from_zsteps(zst)))
-    elif cache.get("nll_steps"):
-        for sid, nst in cache["nll_steps"].items():
-            scores.append((sid, dynamics_metric_from_nll(nst)))
-    else:
-        return []
+# def select_df2_dynamics(cache: Dict[str, Dict[int, np.ndarray]], alpha_g: float = 0.02) -> List[int]:
+#     scores = []
+#     if cache.get("z_steps"):
+#         for sid, zst in cache["z_steps"].items():
+#             scores.append((sid, dynamics_metric_from_zsteps(zst)))
+#     elif cache.get("nll_steps"):
+#         for sid, nst in cache["nll_steps"].items():
+#             scores.append((sid, dynamics_metric_from_nll(nst)))
+#     else:
+#         return []
 
-    scores.sort(key=lambda kv: kv[1], reverse=True)
-    k = max(1, int(len(scores) * alpha_g))
-    return [sid for sid, _ in scores[:k]]
+#     scores.sort(key=lambda kv: kv[1], reverse=True)
+#     k = max(1, int(len(scores) * alpha_g))
+#     return [sid for sid, _ in scores[:k]]
 #robust 통계량 : 극단값 제거 후 평균 계산
 def trimmed_mean(x: np.ndarray, trim_ratio: float = 0.1) -> float:
     if x.size == 0:
@@ -191,7 +191,7 @@ def dynamics_metric_from_zsteps_v2(
     trim_ratio: float = 0.1,
     eps: float = 1e-6,
 ) -> float:
-    dz_vec = z_steps[1:] - z_steps[:-1]
+    dz_vec = z_steps[1:] - z_steps[:-1] #인접한 프레임 간 차이
     dz = np.linalg.norm(dz_vec, axis=-1)
 
     if mode == "normalized":
@@ -205,7 +205,7 @@ def dynamics_metric_from_zsteps_v2(
         return trimmed_mean(dz, trim_ratio)
     return float(dz.mean())
 
-
+# z_steps 또는 nll_steps 기준 상위 alpha_g 비율 선택 : 동적 변화가 큰 데이터 선택용
 def select_df2_dynamics_v2(
     cache: Dict[str, Dict[int, np.ndarray]],
     alpha_g: float = 0.02,
@@ -393,7 +393,7 @@ def _get_labels_map(dataset: Dataset, sids: List[int]) -> Dict[int, int]:
         out[int(sid)] = int(label)
     return out
 
-
+#df2p : 검증 데이터셋에서 오탐된 샘플과 유사한 학습 데이터
 def select_df2_val_fp_train_df(
     cache_train: Dict[str, Dict[int, np.ndarray]],
     train_sids: List[int],
@@ -414,19 +414,21 @@ def select_df2_val_fp_train_df(
     fp_val = []
     for sid in val_sids:
         sid = int(sid)
+        #정상 레이블인 경우에만 오탐 후보로 고려
         if val_label_map.get(sid, None) != int(normal_label):
             continue
         sb = cache_val.get("sB", {}).get(sid)
         if sb is None:
             continue
+        #fp : threshold 보다 높으면 오탐으로 간주 (다 정상데이터지만 모델이 이상치로 판단)
         if float(sb) >= float(tau_base):
             fp_val.append(sid)
 
     tr_ids, tr_X, tr_sb = [], [], []
-    emb_train = cache_train.get("emb", {})
+    emb_train = cache_train.get("emb", {}) 
     sb_train = cache_train.get("sB", {})
-    sb_vals = np.array([sb_train.get(int(s), 0.0) for s in train_sids if int(s) in sb_train], dtype=np.float32)
-    if sb_vals.size > 0:
+    sb_vals = np.array([sb_train.get(int(s), 0.0) for s in train_sids if int(s) in sb_train], dtype=np.float32) #
+    if sb_vals.size > 0: 
         sb_max = float(np.quantile(sb_vals, float(df2p_sb_max_q)))
     else:
         sb_max = float("inf")
@@ -488,6 +490,7 @@ def select_df2_val_fp_train_df(
     knn_k = max(1, min(int(knn_k), tr_X.shape[0]))
     nn = NearestNeighbors(n_neighbors=knn_k, metric="euclidean")
     nn.fit(tr_X)
+    #검증 데이터 오탐 샘플과 유사한 학습 데이터 검색
     dists, idxs = nn.kneighbors(fp_X, return_distance=True)
 
     freq = defaultdict(int)
@@ -503,6 +506,7 @@ def select_df2_val_fp_train_df(
     for sid, cnt in freq.items():
         dmean = dist_sum[sid] / max(1, cnt)
         sb = sid2sb.get(int(sid), 0.0)
+        #FP 유사도 점수 - sb 패널티(움직임없는 경우 이상일 확률이 낮음)
         score = (float(cnt) / (float(dmean) + 1e-6)) - float(df2p_sb_penalty) * float(sb)
         items.append((sid, score, cnt, dmean, sb))
     items.sort(key=lambda x: x[1], reverse=True)

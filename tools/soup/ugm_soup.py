@@ -336,12 +336,14 @@ def main():
 
     k_models = len(args.checkpoints)
     grid_values = list(args.grid_values)
+    alpha_key_precision = 8
 
     best = None
     best_state = None
     best_alphas = None
     best_metrics = None
     logs = []
+    seen_alphas = set()
 
     for combo in itertools.product(grid_values, repeat=k_models):
         combo = list(combo)
@@ -355,6 +357,12 @@ def main():
             alphas = combo
             if sum(alphas) == 0:
                 continue
+
+        # Avoid duplicate alpha vectors (e.g., scaled combos that normalize to the same weights).
+        key = tuple(round(float(a), alpha_key_precision) for a in alphas)
+        if key in seen_alphas:
+            continue
+        seen_alphas.add(key)
 
         merged = ugm_merge_state_dicts(
             models=models,
