@@ -86,6 +86,68 @@ def _merge_with_defaults(loaded_args: Optional[argparse.Namespace]) -> argparse.
     return base_args
 
 
+def _init_rng(seed: Optional[int]) -> np.random.Generator:
+    if seed is None:
+        return np.random.default_rng()
+    try:
+        seed = int(seed)
+    except (TypeError, ValueError):
+        return np.random.default_rng()
+    if seed == 999:
+        return np.random.default_rng()
+    return np.random.default_rng(seed)
+
+
+def _safe_metric(metrics: Dict[str, float], key: str) -> Optional[float]:
+    if metrics is None or key not in metrics:
+        return None
+    try:
+        score = float(metrics[key])
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(score):
+        return None
+    return score
+
+
+def _sample_near_logit(alpha: List[float], sigma: float, rng: np.random.Generator) -> List[float]:
+    a = np.asarray(alpha, dtype=np.float64)
+    a = np.clip(a, 1e-12, 1.0)
+    logit = np.log(a)
+    z = logit + rng.normal(0.0, sigma, size=logit.shape)
+    e = np.exp(z - np.max(z))
+    out = (e / e.sum()).astype(np.float32, copy=False)
+    return out.tolist()
+
+
+def _sample_near_dirichlet_center(alpha: List[float], conc: float, rng: np.random.Generator) -> List[float]:
+    a = np.asarray(alpha, dtype=np.float64)
+    a = np.clip(a, 1e-12, 1.0)
+    out = rng.dirichlet(a * conc).astype(np.float32, copy=False)
+    return out.tolist()
+
+
+def _sample_from_elites(
+    elites: List[List[float]],
+    n: int,
+    method: str,
+    sigma: float,
+    conc: float,
+    rng: np.random.Generator,
+) -> List[List[float]]:
+    if not elites or n <= 0:
+        return []
+    idxs = rng.integers(0, len(elites), size=int(n))
+    out = []
+    for idx in idxs:
+        base = elites[int(idx)]
+        if method == "logit":
+            out.append(_sample_near_logit(base, sigma, rng))
+        else:
+            out.append(_sample_near_dirichlet_center(base, conc, rng))
+    return out
+
+
 def _normalize_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     new_state: Dict[str, torch.Tensor] = {}
     for k, v in list(state_dict.items()):
@@ -368,6 +430,26 @@ def parse_args():
     ap.add_argument("--grid_values", nargs="+", type=float, default=[0.0, 0.5, 1.0])
     ap.add_argument("--grid_normalize", action="store_true")
     ap.add_argument("--select_by", choices=["roc_auc", "pr_auc", "f1"], default="roc_auc")
+    ap.add_argument("--random_search", action="store_true",
+                    help="Random Dirichlet search over alphas.")
+    ap.add_argument("--num_samples", type=int, default=200,
+                    help="Number of random alpha samples.")
+    ap.add_argument("--fast_max_batches", type=int, default=150,
+                    help="Max test batches for fast stage (<=0 = full test).")
+    ap.add_argument("--topk", type=int, default=30,
+                    help="Top-K candidates to re-evaluate on full test.")
+    ap.add_argument("--dirichlet_alpha", type=float, default=0.3,
+                    help="Dirichlet concentration for random alphas.")
+    ap.add_argument("--adaptive_rounds", type=int, default=1,
+                    help="Adaptive full-eval rounds (>=1).")
+    ap.add_argument("--elite_delta", type=float, default=0.002,
+                    help="Elite threshold: score >= best - delta.")
+    ap.add_argument("--local_method", choices=["logit", "dirichlet"], default="logit",
+                    help="Local sampling method around elites.")
+    ap.add_argument("--local_sigma", type=float, default=0.3,
+                    help="Stddev for logit+noise sampling.")
+    ap.add_argument("--local_conc", type=float, default=50.0,
+                    help="Dirichlet concentration for local sampling.")
 
     ap.add_argument("--save_scores_dir", type=Path, default=None,
                     help="If set, cache per-ckpt normality_scores as .npy.")
@@ -530,10 +612,22 @@ def main():
     k_models = len(normed)
     logger.info("Ensembling K=%d models, N=%d samples, norm=%s", k_models, n0, args.normalize_scores)
 
-    def eval_alphas(alphas: List[float]) -> Dict[str, float]:
+    batch_size = test_loader.batch_size or getattr(ref_args, "batch_size", 256)
+
+    def eval_alphas(alphas: List[float], max_batches: int = 0) -> Dict[str, float]:
         a = np.asarray(alphas, dtype=np.float32)
         if a.size != k_models:
             raise ValueError("alpha size mismatch")
+        if max_batches > 0:
+            fast_n = min(n0, int(max_batches) * int(batch_size))
+            ens = np.zeros((fast_n,), dtype=np.float32)
+            for w, sc in zip(a, normed):
+                ens += float(w) * sc[:fast_n]
+            if fast_n < n0:
+                full_scores = np.full((n0,), np.inf, dtype=np.float32)
+                full_scores[:fast_n] = ens
+                return _compute_metrics_from_normality_scores(full_scores, test_metadata, ref_args, args.f1_threshold)
+            return _compute_metrics_from_normality_scores(ens, test_metadata, ref_args, args.f1_threshold)
         ens = np.zeros_like(normed[0], dtype=np.float32)
         for w, sc in zip(a, normed):
             ens += float(w) * sc
@@ -544,7 +638,166 @@ def main():
     best_metrics = None
     logs = []
 
-    if not args.grid_search:
+    fast_logs = None
+    round_summaries = None
+    if args.grid_search and args.random_search:
+        raise ValueError("Use only one of --grid_search or --random_search.")
+
+    if args.random_search:
+        if args.dirichlet_alpha <= 0:
+            raise ValueError("--dirichlet_alpha must be > 0")
+        num_samples = int(args.num_samples)
+        if num_samples <= 0:
+            raise ValueError("--num_samples must be > 0")
+        fast_max_batches = int(args.fast_max_batches)
+        topk = int(args.topk)
+        fast_is_full = fast_max_batches <= 0 or fast_max_batches >= len(test_loader)
+        adaptive_rounds = int(args.adaptive_rounds)
+        if adaptive_rounds <= 0:
+            raise ValueError("--adaptive_rounds must be >= 1")
+        elite_delta = float(args.elite_delta)
+        if elite_delta < 0:
+            raise ValueError("--elite_delta must be >= 0")
+        local_method = args.local_method
+        local_sigma = float(args.local_sigma)
+        local_conc = float(args.local_conc)
+        if local_method == "logit" and local_sigma <= 0:
+            raise ValueError("--local_sigma must be > 0")
+        if local_method == "dirichlet" and local_conc <= 0:
+            raise ValueError("--local_conc must be > 0")
+        rng = _init_rng(getattr(ref_args, "seed", None))
+
+        if adaptive_rounds > 1:
+            if fast_max_batches > 0:
+                logger.warning("adaptive_rounds uses partial eval (fast_max_batches=%d).", fast_max_batches)
+            if args.select_by == "f1":
+                logger.warning("adaptive search with select_by=f1 can be unstable; consider roc_auc/pr_auc.")
+            logger.info(
+                "Adaptive search: rounds=%d samples=%d elite_delta=%.4g local_method=%s",
+                adaptive_rounds, num_samples, elite_delta, local_method,
+            )
+            round_summaries = []
+            elites: List[List[float]] = []
+            for round_idx in range(adaptive_rounds):
+                if round_idx == 0 or not elites:
+                    samples = [
+                        rng.dirichlet([float(args.dirichlet_alpha)] * k_models).tolist()
+                        for _ in range(num_samples)
+                    ]
+                    sample_mode = "global"
+                else:
+                    samples = _sample_from_elites(
+                        elites=elites,
+                        n=num_samples,
+                        method=local_method,
+                        sigma=local_sigma,
+                        conc=local_conc,
+                        rng=rng,
+                    )
+                    if len(samples) < num_samples:
+                        extra = [
+                            rng.dirichlet([float(args.dirichlet_alpha)] * k_models).tolist()
+                            for _ in range(num_samples - len(samples))
+                        ]
+                        samples.extend(extra)
+                    sample_mode = "local"
+
+                round_entries = []
+                round_best = None
+                for alphas in samples:
+                    metrics = eval_alphas(alphas, max_batches=fast_max_batches)
+                    entry = {"round": round_idx + 1, "alphas": alphas, "metrics": metrics}
+                    logs.append(entry)
+                    round_entries.append(entry)
+
+                    score = _safe_metric(metrics, args.select_by)
+                    if score is None:
+                        continue
+                    if round_best is None or score > round_best:
+                        round_best = score
+                    if best is None or score > best:
+                        best = score
+                        best_alphas = alphas
+                        best_metrics = metrics
+                        logger.info("New best %s=%.4f with alphas=%s metrics=%s", args.select_by, best, best_alphas, best_metrics)
+
+                elites = []
+                if round_best is not None:
+                    for entry in round_entries:
+                        score = _safe_metric(entry["metrics"], args.select_by)
+                        if score is None:
+                            continue
+                        if score >= round_best - elite_delta:
+                            elites.append(entry["alphas"])
+                round_summaries.append(
+                    {
+                        "round": int(round_idx + 1),
+                        "best_score": round_best,
+                        "elite_count": int(len(elites)),
+                        "sample_mode": sample_mode,
+                    }
+                )
+        else:
+            if args.select_by == "f1" and fast_max_batches > 0:
+                logger.warning("fast stage with select_by=f1 can be unstable; consider roc_auc/pr_auc.")
+            logger.info(
+                "Random search: samples=%d dirichlet_alpha=%.3f fast_max_batches=%d topk=%d",
+                num_samples, float(args.dirichlet_alpha), fast_max_batches, topk,
+            )
+
+            fast_logs = []
+            fast_candidates = []
+            best_fast = None
+            best_fast_alphas = None
+            best_fast_metrics = None
+
+            for _ in range(num_samples):
+                alphas = rng.dirichlet([float(args.dirichlet_alpha)] * k_models).tolist()
+                metrics = eval_alphas(alphas, max_batches=fast_max_batches)
+                fast_logs.append({"alphas": alphas, "metrics": metrics})
+
+                score = _safe_metric(metrics, args.select_by)
+                if score is None:
+                    continue
+                fast_candidates.append({"score": score, "alphas": alphas})
+
+                if best_fast is None or score > best_fast:
+                    best_fast = score
+                    best_fast_alphas = alphas
+                    best_fast_metrics = metrics
+                    logger.info("New best (fast) %s=%.4f with alphas=%s", args.select_by, best_fast, best_fast_alphas)
+
+            if fast_is_full:
+                logger.info("fast_max_batches covers full test; skipping stage2.")
+            if (not fast_is_full) and topk > 0 and fast_candidates:
+                topk = min(topk, len(fast_candidates))
+                fast_candidates.sort(key=lambda x: x["score"], reverse=True)
+                top_alphas = [c["alphas"] for c in fast_candidates[:topk]]
+                logs = []
+                best = None
+                best_alphas = None
+                best_metrics = None
+                for alphas in top_alphas:
+                    metrics = eval_alphas(alphas, max_batches=0)
+                    logs.append({"alphas": alphas, "metrics": metrics})
+                    score = _safe_metric(metrics, args.select_by)
+                    if score is None:
+                        continue
+                    if best is None or score > best:
+                        best = score
+                        best_alphas = alphas
+                        best_metrics = metrics
+                        logger.info("New best %s=%.4f with alphas=%s metrics=%s", args.select_by, best, best_alphas, best_metrics)
+                if best_alphas is None:
+                    logger.warning("No valid full-eval candidate; falling back to fast stage best.")
+                    best_alphas = best_fast_alphas
+                    best_metrics = best_fast_metrics
+            else:
+                logs = fast_logs
+                best = best_fast
+                best_alphas = best_fast_alphas
+                best_metrics = best_fast_metrics
+    elif not args.grid_search:
         alphas = [1.0 / k_models] * k_models
         metrics = eval_alphas(alphas)
         best_alphas, best_metrics = alphas, metrics
@@ -663,6 +916,16 @@ def main():
         "grid_values": list(args.grid_values),
         "grid_normalize": bool(args.grid_normalize),
         "select_by": args.select_by,
+        "random_search": bool(args.random_search),
+        "num_samples": int(args.num_samples),
+        "fast_max_batches": int(args.fast_max_batches),
+        "topk": int(args.topk),
+        "dirichlet_alpha": float(args.dirichlet_alpha),
+        "adaptive_rounds": int(args.adaptive_rounds),
+        "elite_delta": float(args.elite_delta),
+        "local_method": args.local_method,
+        "local_sigma": float(args.local_sigma),
+        "local_conc": float(args.local_conc),
         "pvalue_ensemble": bool(args.pvalue_ensemble),
         "pvalue_tail": args.pvalue_tail,
         "pvalue_cal_split": args.pvalue_cal_split,
@@ -674,6 +937,8 @@ def main():
         "best_alphas": best_alphas,
         "best_metrics": best_metrics,
         "logs": logs,
+        "fast_logs": fast_logs,
+        "round_summaries": round_summaries,
         "pvalue_ensembles": pvalue_ensembles,
     }
     with open(args.output_json, "w") as f:
