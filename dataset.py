@@ -123,7 +123,8 @@ def get_dataset_and_loader(args, trans_list, only_test=False):
     loader_args = {'batch_size': args.batch_size, 'num_workers': args.num_workers, 'pin_memory': True}
     dataset_args = {'headless': args.headless, 'scale': args.norm_scale, 'scale_proportional': args.prop_norm_scale,
                     'seg_len': args.seg_len, 'return_indices': True, 'return_metadata': True, "dataset": args.dataset,
-                    'train_seg_conf_th': args.train_seg_conf_th, 'specific_clip': args.specific_clip}
+                    'train_seg_conf_th': args.train_seg_conf_th, 'specific_clip': args.specific_clip,
+                    'disable_tqdm': bool(getattr(args, "disable_tqdm", False) or getattr(args, "no_progress", False))}
     dataset, loader = dict(), dict()
     splits = ['train', 'test'] if not only_test else ['test']
     for split in splits:
@@ -170,7 +171,8 @@ def gen_dataset(person_json_root, num_clips=None, kp18_format=True, ret_keys=Fal
     json_list = sorted([fn for fn in dir_list if fn.endswith('tracked_person.json')])
     if num_clips is not None:
         json_list = [json_list[num_clips]]  # For debugging purposes
-    for person_dict_fn in tqdm(json_list):
+    disable_tqdm = bool(dataset_args.get("disable_tqdm", False))
+    for person_dict_fn in tqdm(json_list, disable=disable_tqdm):
         if dataset == "UBnormal":
             type, scene_id, clip_id = \
                 re.findall('(abnormal|normal)_scene_(\d+)_scenario(.*)_alphapose_.*', person_dict_fn)[0]

@@ -472,11 +472,18 @@ def parse_args():
                     help="Normal label used for zscore calibration.")
 
     ap.add_argument("--output_json", type=Path, required=True)
+    ap.add_argument("--no_progress", action="store_true",
+                    help="Disable tqdm progress output.")
+    ap.add_argument("--roc_only", action="store_true",
+                    help="Silence logs and print only best ROC.")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.roc_only:
+        args.no_progress = True
+        args.log_level = "ERROR"
     logger = _setup_logger(args.log_level)
 
     if args.reference_args is None and args.reference_ckpt is None:
@@ -494,6 +501,8 @@ def main():
             logger.warning("checkpoint has no args: %s. Using defaults.", args.reference_ckpt)
 
     ref_args = _merge_with_defaults(loaded_args)
+    ref_args.no_progress = bool(args.no_progress)
+    ref_args.disable_tqdm = bool(args.no_progress)
     if args.dataset is not None:
         ref_args.dataset = args.dataset
     if args.data_dir is not None:
@@ -944,6 +953,9 @@ def main():
     with open(args.output_json, "w") as f:
         json.dump(out, f, indent=2)
     logger.info("Saved ensemble result JSON: %s", args.output_json)
+    if args.roc_only:
+        roc = float("nan") if best_metrics is None else float(best_metrics.get("roc_auc", float("nan")))
+        print(f"{roc:.6f}")
 
 
 if __name__ == "__main__":

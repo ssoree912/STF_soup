@@ -362,12 +362,19 @@ def parse_args():
 
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--metrics_json", type=Path, default=None)
+    ap.add_argument("--no_progress", action="store_true",
+                    help="Disable tqdm progress output.")
+    ap.add_argument("--roc_only", action="store_true",
+                    help="Silence logs and print only best ROC.")
     ap.add_argument("--log_level", default="INFO")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.roc_only:
+        args.no_progress = True
+        args.log_level = "ERROR"
     logger = _setup_logger(args.log_level)
 
     if len(args.checkpoints) != len(args.fishers):
@@ -385,6 +392,8 @@ def main():
             logger.warning("checkpoint has no args: %s. Using defaults.", args.reference_ckpt)
 
     ref_args = _merge_with_defaults(loaded_args)
+    ref_args.no_progress = bool(args.no_progress)
+    ref_args.disable_tqdm = bool(args.no_progress)
     if args.dataset is not None:
         ref_args.dataset = args.dataset
     if args.data_dir is not None:
@@ -705,6 +714,8 @@ def main():
                 f,
                 indent=2,
             )
+        if args.roc_only:
+            print("nan")
         return
 
     ckpt_payload = {
@@ -743,6 +754,9 @@ def main():
         json.dump(payload, f, indent=2)
     logger.info("Saved best merged ckpt to %s", args.output)
     logger.info("Saved metrics/logs to %s", metrics_path)
+    if args.roc_only:
+        roc = float("nan") if best_metrics is None else float(best_metrics.get("roc_auc", float("nan")))
+        print(f"{roc:.6f}")
 
 
 if __name__ == "__main__":

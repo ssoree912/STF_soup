@@ -33,6 +33,14 @@ def get_dataset_scores(scores, metadata, args=None):
     dataset_scores_arr = []
     metadata_np = np.array(metadata)
 
+    disable_tqdm = False
+    if args is not None:
+        disable_tqdm = bool(getattr(args, "disable_tqdm", False)) or bool(
+            getattr(args, "no_progress", False)
+        )
+        if int(getattr(args, "verbose", 1)) <= 0:
+            disable_tqdm = True
+
     if args.dataset == 'UBnormal':
         pose_segs_root = 'data/UBnormal/pose/test'
         clip_list = os.listdir(pose_segs_root)
@@ -44,8 +52,9 @@ def get_dataset_scores(scores, metadata, args=None):
         clip_list = os.listdir(per_frame_scores_root)
         clip_list = sorted(fn for fn in clip_list if fn.endswith('.npy'))
 
-    print("Scoring {} clips".format(len(clip_list)))
-    for clip in tqdm(clip_list):
+    if not disable_tqdm:
+        print("Scoring {} clips".format(len(clip_list)))
+    for clip in tqdm(clip_list, disable=disable_tqdm):
         clip_gt, clip_score = get_clip_score(scores, clip, metadata_np, metadata, per_frame_scores_root, args)
         if clip_score is not None:
             dataset_gt_arr.append(clip_gt)
