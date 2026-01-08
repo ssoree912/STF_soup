@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#fisher : 민감한 파라미터를 계산, 
 import argparse
 import json
 import os
@@ -140,8 +141,9 @@ def _accumulate_fisher(
         loss = nll.mean()
 
         model.zero_grad(set_to_none=True)
+        #미분
         loss.backward()
-
+        #gradient 제곱 누적 -> 기울기가 크다는 것은 그만큼 민감
         for name, param in model.named_parameters():
             if name in fisher and param.grad is not None:
                 fisher[name].add_(param.grad.detach() ** 2)

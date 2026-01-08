@@ -440,16 +440,6 @@ def parse_args():
                     help="Top-K candidates to re-evaluate on full test.")
     ap.add_argument("--dirichlet_alpha", type=float, default=0.3,
                     help="Dirichlet concentration for random alphas.")
-    ap.add_argument("--adaptive_rounds", type=int, default=1,
-                    help="Adaptive full-eval rounds (>=1).")
-    ap.add_argument("--elite_delta", type=float, default=0.002,
-                    help="Elite threshold: score >= best - delta.")
-    ap.add_argument("--local_method", choices=["logit", "dirichlet"], default="logit",
-                    help="Local sampling method around elites.")
-    ap.add_argument("--local_sigma", type=float, default=0.3,
-                    help="Stddev for logit+noise sampling.")
-    ap.add_argument("--local_conc", type=float, default=50.0,
-                    help="Dirichlet concentration for local sampling.")
 
     ap.add_argument("--save_scores_dir", type=Path, default=None,
                     help="If set, cache per-ckpt normality_scores as .npy.")
@@ -649,6 +639,11 @@ def main():
 
     fast_logs = None
     round_summaries = None
+    adaptive_rounds = 1
+    elite_delta = 0.002
+    local_method = "logit"
+    local_sigma = 0.3
+    local_conc = 50.0
     if args.grid_search and args.random_search:
         raise ValueError("Use only one of --grid_search or --random_search.")
 
@@ -661,19 +656,6 @@ def main():
         fast_max_batches = int(args.fast_max_batches)
         topk = int(args.topk)
         fast_is_full = fast_max_batches <= 0 or fast_max_batches >= len(test_loader)
-        adaptive_rounds = int(args.adaptive_rounds)
-        if adaptive_rounds <= 0:
-            raise ValueError("--adaptive_rounds must be >= 1")
-        elite_delta = float(args.elite_delta)
-        if elite_delta < 0:
-            raise ValueError("--elite_delta must be >= 0")
-        local_method = args.local_method
-        local_sigma = float(args.local_sigma)
-        local_conc = float(args.local_conc)
-        if local_method == "logit" and local_sigma <= 0:
-            raise ValueError("--local_sigma must be > 0")
-        if local_method == "dirichlet" and local_conc <= 0:
-            raise ValueError("--local_conc must be > 0")
         rng = _init_rng(getattr(ref_args, "seed", None))
 
         if adaptive_rounds > 1:
@@ -930,11 +912,11 @@ def main():
         "fast_max_batches": int(args.fast_max_batches),
         "topk": int(args.topk),
         "dirichlet_alpha": float(args.dirichlet_alpha),
-        "adaptive_rounds": int(args.adaptive_rounds),
-        "elite_delta": float(args.elite_delta),
-        "local_method": args.local_method,
-        "local_sigma": float(args.local_sigma),
-        "local_conc": float(args.local_conc),
+        "adaptive_rounds": int(adaptive_rounds),
+        "elite_delta": float(elite_delta),
+        "local_method": local_method,
+        "local_sigma": float(local_sigma),
+        "local_conc": float(local_conc),
         "pvalue_ensemble": bool(args.pvalue_ensemble),
         "pvalue_tail": args.pvalue_tail,
         "pvalue_cal_split": args.pvalue_cal_split,

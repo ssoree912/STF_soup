@@ -327,9 +327,7 @@ def parse_args():
     ap.add_argument("--checkpoints", nargs="+", required=True)
     ap.add_argument("--fishers", nargs="+", required=True)
 
-    ap.add_argument("--ref_idx", type=int, default=0)
     ap.add_argument("--eps", type=float, default=1e-8)
-    ap.add_argument("--no_ref_fisher", action="store_true")
 
     ap.add_argument("--grid_search", action="store_true")
     ap.add_argument("--grid_values", nargs="+", type=float, default=[0.0, 0.5, 1.0])
@@ -345,23 +343,12 @@ def parse_args():
                     help="Top-K candidates to re-evaluate on full test.")
     ap.add_argument("--dirichlet_alpha", type=float, default=0.3,
                     help="Dirichlet concentration for random alphas.")
-    ap.add_argument("--adaptive_rounds", type=int, default=1,
-                    help="Adaptive full-eval rounds (>=1).")
-    ap.add_argument("--elite_delta", type=float, default=0.002,
-                    help="Elite threshold: score >= best - delta.")
-    ap.add_argument("--local_method", choices=["logit", "dirichlet"], default="logit",
-                    help="Local sampling method around elites.")
-    ap.add_argument("--local_sigma", type=float, default=0.3,
-                    help="Stddev for logit+noise sampling.")
-    ap.add_argument("--local_conc", type=float, default=50.0,
-                    help="Dirichlet concentration for local sampling.")
 
     ap.add_argument("--device", default=None)
     ap.add_argument("--gpu_id", type=int, default=0)
     ap.add_argument("--f1_threshold", type=float, default=0.5)
 
     ap.add_argument("--output", type=Path, required=True)
-    ap.add_argument("--metrics_json", type=Path, default=None)
     ap.add_argument("--no_progress", action="store_true",
                     help="Disable tqdm progress output.")
     ap.add_argument("--roc_only", action="store_true",
@@ -423,7 +410,8 @@ def main():
         fishers.append(_normalize_fisher_to_state_dict(fobj, sd, eps=args.eps))
         fisher_metas.append(meta)
 
-    use_ref_fisher = not args.no_ref_fisher
+    use_ref_fisher = True
+    ref_idx = 0
 
     def evaluate_merged(state_dict: Dict[str, torch.Tensor], max_batches: int = 0) -> Dict[str, float]:
         model = STG_NF(**model_args)
@@ -456,6 +444,11 @@ def main():
     logs = []
     fast_logs = None
     round_summaries = None
+    adaptive_rounds = 1
+    elite_delta = 0.002
+    local_method = "logit"
+    local_sigma = 0.3
+    local_conc = 50.0
 
     if args.random_search:
         if args.dirichlet_alpha <= 0:
@@ -466,19 +459,6 @@ def main():
         fast_max_batches = int(args.fast_max_batches)
         topk = int(args.topk)
         fast_is_full = fast_max_batches <= 0 or fast_max_batches >= len(test_loader)
-        adaptive_rounds = int(args.adaptive_rounds)
-        if adaptive_rounds <= 0:
-            raise ValueError("--adaptive_rounds must be >= 1")
-        elite_delta = float(args.elite_delta)
-        if elite_delta < 0:
-            raise ValueError("--elite_delta must be >= 0")
-        local_method = args.local_method
-        local_sigma = float(args.local_sigma)
-        local_conc = float(args.local_conc)
-        if local_method == "logit" and local_sigma <= 0:
-            raise ValueError("--local_sigma must be > 0")
-        if local_method == "dirichlet" and local_conc <= 0:
-            raise ValueError("--local_conc must be > 0")
         rng = _init_rng(getattr(ref_args, "seed", None))
 
         if adaptive_rounds > 1:
@@ -523,7 +503,7 @@ def main():
                         models=models,
                         fishers=fishers,
                         alphas=torch.tensor(alphas, dtype=torch.float32),
-                        ref_idx=args.ref_idx,
+                        ref_idx=ref_idx,
                         eps=args.eps,
                         use_ref_fisher=use_ref_fisher,
                     )
@@ -577,7 +557,7 @@ def main():
                     models=models,
                     fishers=fishers,
                     alphas=torch.tensor(alphas, dtype=torch.float32),
-                    ref_idx=args.ref_idx,
+                    ref_idx=ref_idx,
                     eps=args.eps,
                     use_ref_fisher=use_ref_fisher,
                 )
@@ -612,7 +592,7 @@ def main():
                         models=models,
                         fishers=fishers,
                         alphas=torch.tensor(alphas, dtype=torch.float32),
-                        ref_idx=args.ref_idx,
+                        ref_idx=ref_idx,
                         eps=args.eps,
                         use_ref_fisher=use_ref_fisher,
                     )
@@ -666,7 +646,7 @@ def main():
                 models=models,
                 fishers=fishers,
                 alphas=torch.tensor(alphas, dtype=torch.float32),
-                ref_idx=args.ref_idx,
+                ref_idx=ref_idx,
                 eps=args.eps,
                 use_ref_fisher=use_ref_fisher,
             )
@@ -694,7 +674,7 @@ def main():
                 logger.info("New best %s=%.4f with alphas=%s", args.select_by, best, best_alphas)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    metrics_path = args.metrics_json or args.output.with_suffix(".metrics.json")
+    metrics_path = args.output.with_suffix(".metrics.json")
 
     if best_state is None:
         logger.warning("No valid combination found.")
@@ -704,11 +684,11 @@ def main():
                     "best": None,
                     "logs": logs,
                     "fast_logs": fast_logs,
-                    "adaptive_rounds": int(args.adaptive_rounds),
-                    "elite_delta": float(args.elite_delta),
-                    "local_method": args.local_method,
-                    "local_sigma": float(args.local_sigma),
-                    "local_conc": float(args.local_conc),
+                    "adaptive_rounds": int(adaptive_rounds),
+                    "elite_delta": float(elite_delta),
+                    "local_method": local_method,
+                    "local_sigma": float(local_sigma),
+                    "local_conc": float(local_conc),
                     "round_summaries": round_summaries,
                 },
                 f,
@@ -740,11 +720,11 @@ def main():
         "fast_max_batches": int(args.fast_max_batches),
         "topk": int(args.topk),
         "dirichlet_alpha": float(args.dirichlet_alpha),
-        "adaptive_rounds": int(args.adaptive_rounds),
-        "elite_delta": float(args.elite_delta),
-        "local_method": args.local_method,
-        "local_sigma": float(args.local_sigma),
-        "local_conc": float(args.local_conc),
+        "adaptive_rounds": int(adaptive_rounds),
+        "elite_delta": float(elite_delta),
+        "local_method": local_method,
+        "local_sigma": float(local_sigma),
+        "local_conc": float(local_conc),
         "round_summaries": round_summaries,
         "fisher_meta": fisher_metas,
         "checkpoints": args.checkpoints,
